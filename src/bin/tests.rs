@@ -1,4 +1,4 @@
-use infra::{primitives::{Byte, Byteseq, IChar, IString}};
+use deadflies_rust_infra::{primitives::{Byte, Byteseq, IChar, IString}};
 //use infra::old_js_base;
 //use infra::old_js_base::parse_text;
 use widestring::{U16String, Utf16String};
