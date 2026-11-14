@@ -1,0 +1,67 @@
+StringNumericLiteral
+    StrWhiteSpace(opt)
+        StrWhiteSpaceChar
+            WhiteSpace
+                <TAB> = 0x0009
+                <VT> = 0x000B
+                <FF> = 0x000C
+                <ZWNBSP> = 0xFEFF
+                <USP> = [
+                    0x0020,
+                    0x00A0,
+                    0x1680,
+                    0x2000..=0x200A,
+                    0x202F,
+                    0x205F,
+                    0x3000,
+                ]
+            LineTerminator
+                <LF> = 0x000A
+                <CR> = 0x000D
+                <LS> = 0x2028
+                <PS> = 0x2029
+        StrWhiteSpaceChar + StrWhiteSpace
+    StrNumericLiteral
+        StrDecimalLiteral
+            StrUnsignedDecimalLiteral
+                "Infinity"
+                DecimalDigits
+                    DecimalDigit
+                        one of [0-9]
+                    DecimalDigits + DecimalDigit
+                ExponentPart
+                    ExponentIndicator
+                        one of [eE]
+                    SignedInteger
+                        DecimalDigits
+                        "+" + DecimalDigits
+                        "-" + DecimalDigits
+                    ExponentIndicator + SignedInteger
+                DecimalDigits + "." + DecimalDigits(opt) + ExponentPart(opt)
+                "." + DecimalDigits + ExponentPart(opt)
+                DecimalDigits + ExponentPart(opt)
+            "+" + StrUnsignedDecimalLiteral
+            "-" + StrUnsignedDecimalLiteral
+        NonDecimalIntegerLiteral
+            BinaryIntegerLiteral
+                BinaryDigits
+                    BinaryDigit
+                        one of [01]
+                    BinaryDigits + BinaryDigit
+                "0b" + BinaryDigits
+                "0B" + BinaryDigits
+            OctalIntegerLiteral
+                OctalDigits
+                    OctalDigit
+                        one of [0-7]
+                    OctalDigits + OctalDigit
+                "0o" + OctalDigits
+                "0O" + OctalDigits
+            HexIntegerLiteral
+                HexDigits
+                    HexDigit
+                        one of [0-9][a-f][A-F]
+                    HexDigits + HexDigit
+                "0x" + HexDigits
+                "0X" + HexDigits
+    StrWhiteSpace(opt) + StrNumericLiteral + StrWhiteSpace(opt)

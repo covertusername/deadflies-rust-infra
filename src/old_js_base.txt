@@ -1,0 +1,3718 @@
+/*
+ * *** WARNING WARNING WARNING***
+ * The code in this module only implements the bare minimum of Javascript
+ * semantics into Rust for the purposes of allowing the json module to
+ * operate correctly. It doesn't implement a Javascript interpreter in any
+ * way, shape, or form, though it may be used as the base for one in the
+ * future. Some poor assumptions have been made in the interest of
+ * simplifying the implementation, though it is unclear if they help.
+ * There are also many long lines that I couldn't shorten.
+ * ***end warning***
+ */
+
+/* 
+ * I should probably use a yacc-like-tool to generate the parsing code,
+ * instead of writing it myself, but I didn't feel like it. I have never
+ * rolled my own parser before anyway, so this is a learning experience.
+ * It turned out that Completion Records can be emulated entirely using
+ * Result<> and the ? operator. Normal completions map to Ok(value), throw
+ * completions map to Err() wrapped around the exception object, and the ?
+ * operator works exactly like Rust's. ! is equivalent to .unwrap(). All
+ * other completion types only occur within the Javascript runtime itself
+ * and do not need to be handled at the moment.
+ */
+
+use std::{ops::{Add, Deref, DerefMut, Mul, Neg, Sub}, sync::{Arc, Weak, atomic::{AtomicU64, Ordering}}, ptr::addr_eq, any::Any};
+use num_bigint::BigInt;
+use parking_lot::{Mutex, RwLock};
+use crate::{primitives::{IChar, IString}, structs::{List, ListCore, Map, ArcRw}, util::{ichars_to_string, is_eq_arcslice, unwrap_arcslice}};
+
+type Parser = fn(&List<IChar>, &mut ParseNode) -> Result<(), String>;
+
+const DEBUG: bool = false;
+
+pub static KNOWN_SYMBOLS: Mutex<Map<&str, Arc<Symbol>>> = Mutex::new(Map::new());
+#[allow(dead_code)] // for future use
+static KNOWN_OBJECTS: Mutex<Map<&str, ArcRw<dyn Object>>> = Mutex::new(Map::new());
+
+#[derive(Clone)]
+pub enum JType {
+    Undefined,
+    Null,
+    Bool(bool),
+    JString(IString),
+    Symbol(Arc<Symbol>),
+    Number(Number),
+    BigInt(BigInt),
+    Object(ArcRw<dyn Object>),
+}
+
+impl std::fmt::Debug for JType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undefined => write!(f, "Undefined"),
+            Self::Null => write!(f, "Null"),
+            Self::Bool(arg0) => f.debug_tuple("Bool").field(arg0).finish(),
+            Self::JString(arg0) => f.debug_tuple("JString").field(arg0).finish(),
+            Self::Symbol(arg0) => f.debug_tuple("Symbol").field(arg0).finish(),
+            Self::Number(arg0) => f.debug_tuple("Number").field(arg0).finish(),
+            Self::BigInt(arg0) => f.debug_tuple("BigInt").field(arg0).finish(),
+            // going to need to implement real Object debug formatting later
+            Self::Object(arg0) => f.debug_tuple("Object").field(arg0).finish(),
+        }
+    }
+}
+
+impl JType {
+    /// Unwraps a Number from a `JType`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `JType` is not `JType::Number`.
+    // for the sake of convenience
+    #[must_use]
+    pub fn number(&self) -> Number {
+        if let Self::Number(x) = self {
+            return *x;
+        }
+        panic!("oops, the type wasn't a number")
+    }
+
+    #[must_use]
+    pub fn is_number(&self) -> bool {
+        if let Self::Number(_) = self {
+            return true;
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn is_object(&self) -> bool {
+        if let Self::Object(_) = self {
+            return true;
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn is_not_object(&self) -> bool {
+        !self.is_object()
+    }
+
+    #[must_use]
+    pub fn same_type(&self, other: &Self) -> bool {
+        matches!((self, other),
+        (JType::Undefined, JType::Undefined) |
+            (JType::Null, JType::Null) |
+            (JType::Bool(_), JType::Bool(_)) | 
+            (JType::JString(_), JType::JString(_)) |
+            (JType::Symbol(_), JType::Symbol(_)) |
+            (JType::Number(_), JType::Number(_)) |
+            (JType::BigInt(_), JType::BigInt(_)) |
+            (JType::Object(_), JType::Object(_)))
+    }
+
+    /// The rest of `same_value`.
+    /// 
+    /// # Panics
+    /// Panics if the arguments aren't the same type, or if either is a Number.
+    #[must_use]
+    pub fn same_value_non_number(&self, other: &Self) -> bool {
+        match (self, other) {
+            (JType::Undefined, JType::Undefined) |
+            (JType::Null, JType::Null) => true,
+            (JType::Bool(x), JType::Bool(y)) => x == y,
+            (JType::JString(x), JType::JString(y)) => x == y,
+            (JType::Symbol(x), JType::Symbol(y)) => x == y,
+            (JType::BigInt(x), JType::BigInt(y)) => x == y,
+            (JType::Object(x), JType::Object(y)) =>
+                Arc::ptr_eq(x, y),
+            (_, JType::Number(_)) => 
+                panic!("same_value_non_number: other is a number!"),
+            (JType::Number(_), _) =>
+                panic!("same_value_non_number: self is a number!"),
+            _ =>
+                panic!("same_value_non_number: other and self must be the same type!")
+        }
+    }
+
+    #[must_use]
+    pub fn same_value(&self, other: &Self) -> bool {
+        if !self.same_type(other) {
+            return false
+        }
+        if let Self::Number(x) = self && let Self::Number(y) = other {
+            return x.same_value(y)
+        }
+        self.same_value_non_number(other)
+    }
+
+    #[must_use]
+    pub fn to_object(&self) -> Result<ArcRw<dyn Object>, Box<dyn Object>> {
+        match self {
+            JType::Undefined | JType::Null => todo!(),
+            JType::Bool(_) => todo!(),
+            JType::JString(istring) => todo!(),
+            JType::Symbol(symbol) => todo!(),
+            JType::Number(number) => todo!(),
+            JType::BigInt(big_int) => todo!(),
+            JType::Object(rw) => todo!(),
+        }
+    }
+
+    #[must_use]
+    pub fn to_boolean(&self) -> bool {
+        match self {
+            JType::Bool(b) => *b,
+            JType::Undefined | JType::Null => false,
+            JType::Number(number) => !(number.0 == 0.0 || number.0.is_nan()),
+            JType::BigInt(big_int) => !(*big_int == BigInt::from(0)),
+            JType::JString(istring) => !istring.is_empty(),
+            // if host is a web browser and self is object, check IsHTMLDDA
+            _ => true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_constructor(&self) -> bool {
+        if let Self::Object(argument) = self {
+            return argument.read().is_constructor()
+        }
+        false
+    }
+}
+
+pub enum JSpecType<T>
+where
+    T: 'static,
+{
+    None,
+    List(List<T>),
+    Record(Record<T>),
+    /*
+     * Set and Relation go here but are specific to Javascript's memory model
+     * and as such can be avoided for now
+     * then we have completion records, which map to the Result type and its
+     * operations, at least within the spec itself - other completion types
+     * exist during the actual Javascript parsing process and can be ignored
+     * for right now as well. i can substitute Results in the enum for now.
+     * i have not seen any algorithms (yet) that have the error be anything
+     * other than an Object via the various exception objects.
+     * i hate that the T is inside an ArcRw but it's required for
+     * consistency (and to implement Clone)
+     */
+    Completion(Result<ArcRw<T>, ArcRw<dyn Object>>),
+    /*
+     * then we have references, which are also javascript implementation
+     * details and can be ignored as well
+     */
+    PropDesc(PropDesc),
+    /*
+     * environment records are related to Javascript scoping rules and can be
+     * ignored along with the other ignored types. (no longer true)
+     * closures can't really be implemented directly but can be emulated within
+     * algorithms using Rust closures.
+     * data blocks _look_ like Infra byte sequences but aren't. they are
+     * related to the Javascript memory model and can be ignored for now
+     */
+    PrivElem(PrivElem),
+    ClassFieldDef(ClassFieldDef),
+    /* 
+     * next are private names. i don't understand the difference between these
+     * and Symbols at all, except that their descriptions cannot be None
+     */
+    PrivName(Arc<Symbol>),
+    // why does this exist? it only contains one value
+    ClassStaticBlockDef(ArcRw<dyn Object>),
+}
+
+impl<T> Clone for JSpecType<T>
+where
+    T: 'static,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::List(arg0) => Self::List(arg0.clone()),
+            Self::Record(arg0) => Self::Record(arg0.clone()),
+            Self::Completion(arg0) => Self::Completion(arg0.clone()),
+            Self::PropDesc(arg0) => Self::PropDesc(arg0.clone()),
+            Self::PrivElem(arg0) => Self::PrivElem(arg0.clone()),
+            Self::ClassFieldDef(arg0) => Self::ClassFieldDef(arg0.clone()),
+            Self::PrivName(arg0) => Self::PrivName(arg0.clone()),
+            Self::ClassStaticBlockDef(arg0) => Self::ClassStaticBlockDef(arg0.clone()),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for JSpecType<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::List(_) => write!(f, "some List"),
+            Self::Record(_) => write!(f, "some Map"),
+            Self::Completion(_) => write!(f, "some Completion"),
+            Self::PropDesc(arg0) => f.debug_tuple("PropDesc").field(arg0).finish(),
+            Self::PrivElem(arg0) => f.debug_tuple("PrivElem").field(arg0).finish(),
+            Self::ClassFieldDef(arg0) => f.debug_tuple("ClassFieldDef").field(arg0).finish(),
+            Self::PrivName(arg0) => f.debug_tuple("PrivName").field(arg0).finish(),
+            Self::ClassStaticBlockDef(_) => write!(f, "some ClassStaticBlockDef"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum JAny<T>
+where
+    T: 'static,
+{
+    None,
+    JType(JType),
+    JSpecType(JSpecType<T>),
+}
+
+impl<T> Clone for JAny<T>
+where
+    T: 'static,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::JType(arg0) => Self::JType(arg0.clone()),
+            Self::JSpecType(arg0) => Self::JSpecType(arg0.clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ParseNode {
+    subnodes: Vec<ParseNode>,
+    parser: Parser,
+    parse_start: usize,
+    curr_loc: usize,
+    /*
+     * can be orig_string.size() if whole string. when passed to parser,
+     * it is as a search endpoint, but once the parser completes, this
+     * should be changed to the location at which the parse ended (i.e
+     * where unparseable characters were found). the location is updated
+     * automatically when using ParseNode::ok() to terminate a parser.
+     * this should NEVER be updated if parsing outright fails.
+     */
+    parse_end: usize,
+    pub value: Option<JType>,
+}
+
+impl ParseNode {
+    // returns Ok(true) if parse is complete
+    fn next_subnode(&mut self, src: &List<IChar>, parser: Parser, parse_end: usize, optional: bool) -> Result<bool, String> {
+        let mut parse_complete = false;
+        let mut next_node = ParseNode {
+            subnodes: Vec::new(),
+            parser,
+            parse_start: self.curr_loc,
+            curr_loc: self.curr_loc,
+            parse_end, 
+            value: None,
+        };
+
+        if let Err(e) = (next_node.parser)(src, &mut next_node) {
+            if !optional {
+                return Err(e);
+            }
+            return Ok(parse_complete);
+        }
+        if DEBUG {
+            println!("next_node.parse_end: {}, self.parse_end: {}", next_node.parse_end, self.parse_end);
+        }
+        if next_node.parse_end == self.parse_end {
+            parse_complete = true;
+        }
+        self.curr_loc = next_node.parse_end;
+        self.subnodes.push(next_node);
+        Ok(parse_complete)
+    }
+
+    fn recurse(&mut self, src: &List<IChar>, parser: Parser, parse_len: usize, expected: &str, err_len: usize) -> Result<(), String> {
+        // defined recursively
+        loop {
+            if self.next_subnode(src, parser, self.curr_loc+parse_len, false).is_err() {
+                break;
+            }
+        }
+        if !self.subnodes.is_empty() {
+            /*
+             * intentionally not using self.ok() here so we can match on the
+             * result in the outer parser and parse from there. self.err()
+             * doesn't do anything extra to my_node so using it is fine
+             */
+            return Ok(());
+        }
+        // didn't find any
+        self.err(src, expected, err_len)
+    }
+
+    fn last_subnode_end(&self) -> usize {
+        if self.subnodes.is_empty() {
+            return self.curr_loc;
+        }
+        self.subnodes[self.subnodes.len()-1].parse_end
+    }
+
+    fn last_subnode_value(&self) -> Option<JType> {
+        if self.subnodes.is_empty() {
+            return self.value.clone();
+        }
+        self.subnodes[self.subnodes.len()-1].value.clone()
+    }
+
+    fn last_subnode_nsubs(&self) -> usize {
+        if self.subnodes.is_empty() {
+            return 0;
+        }
+        self.subnodes[self.subnodes.len()-1].subnodes.len()
+    }
+
+    // if false, will not update self.curr_loc
+    fn match_char(&mut self, src: &List<IChar>, chars: &[u32]) -> bool {
+        for c in chars {
+            if self.curr_loc < src.size() && *c == src[self.curr_loc].read().as_u32() {
+                self.curr_loc += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn match_str(&mut self, src: &List<IChar>, s: &str) -> bool {
+        let digested = IString::from_str(s).to_code_points();
+
+        if self.curr_loc+digested.size() <= src.size() && is_eq_arcslice(&src[self.curr_loc..self.curr_loc+digested.size()], &digested) {
+            self.curr_loc += digested.size();
+            return true;
+        }
+        false
+    }
+
+    // the wrapping here is intentional to make the parsers cleaner
+    #[allow(clippy::unnecessary_wraps)]
+    fn ok(&mut self, my_name: &str) -> Result<(), String> {
+        self.parse_end = self.last_subnode_end();
+        if DEBUG {
+            println!("{}, {:#?}", my_name, self.value);
+        }
+        Ok(())
+    }
+
+    fn err(&self, src: &List<IChar>, expected: &str, err_len: usize) -> Result<(), String> {
+        if self.curr_loc+err_len >= src.size() {
+            return Err(format!("reached end of string while parsing, expected {}", expected));
+        }
+        Err(format!("found '{}' at col {}, expected {}", IString::from_ichars(&unwrap_arcslice(&src[self.curr_loc..self.curr_loc+err_len])), self.curr_loc, expected))
+    }
+}
+
+/*
+ * TODO: all the parse* functions are supposed to return SyntaxError
+ * Objects instead of a String but none of that glue is implemented
+ * yet.
+ */
+
+/// # Errors
+/// Expects the first character of `src` to be a hexadecimal digit.
+pub fn parse_hex_digit(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    let chars = [
+        0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037, 0x0038,
+        0x0039, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0061, 0x0062,
+        0x0063, 0x0064, 0x0065, 0x0066
+    ];
+
+    if my_node.match_char(src, &chars) {
+        return my_node.ok("HexDigit");
+    }
+    my_node.err(src, "a hexadecimal digit", 1)
+}
+
+/// # Errors
+/// Expects `src` to begin with one or more hexadecimal digits.
+pub fn parse_hex_digits(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    match my_node.recurse(src, parse_hex_digit, 1, "one or more hexadecimal digits", 1) {
+        Ok(()) => my_node.ok("HexDigits"),
+        Err(e) => Err(e),
+    }
+}
+
+/// # Errors
+/// Expects `src` to be a hexadecimal integer literal.
+#[allow(clippy::cast_precision_loss)] // not much we can do about this
+pub fn parse_hex_integer_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.match_str(src, "0x") || my_node.match_str(src, "0X") {
+        match my_node.next_subnode(src, parse_hex_digits, my_node.parse_end, false) {
+            Ok(_) => {
+                // man-made horrors within our comprehension
+                my_node.value = Some(
+                    JType::Number(
+                        Number(match u64::from_str_radix(
+                            &ichars_to_string(
+                                &unwrap_arcslice(&src[my_node.parse_start+2..my_node.last_subnode_end()])
+                            ), 
+                            16
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return Err(format!("{}", e)),
+                        } as f64)
+                    )
+                );
+                return my_node.ok("HexIntegerLiteral")
+            },
+            Err(e) => return Err(e),
+        }
+    }
+    my_node.err(src, "0x or 0X", 2)
+}
+
+/// # Errors
+/// Expects the first character of `src` to be an octal digit.
+pub fn parse_octal_digit(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    let chars = [
+        0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    ];
+
+    if my_node.match_char(src, &chars) {
+        return my_node.ok("OctalDigit");
+    }
+    my_node.err(src, "an octal digit", 1)
+}
+
+/// # Errors
+/// Expects `src` to begin with one or more octal digits.
+pub fn parse_octal_digits(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    match my_node.recurse(src, parse_octal_digit, 1, "one or more octal digits", 1) {
+        Ok(()) => my_node.ok("OctalDigits"),
+        Err(e) => Err(e),
+    }
+}
+
+/// # Errors
+/// Expects `src` to be an octal integer literal.
+#[allow(clippy::cast_precision_loss)] // not much we can do about this
+pub fn parse_octal_integer_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.match_str(src, "0o") || my_node.match_str(src, "0O") {
+        match my_node.next_subnode(src, parse_octal_digits, my_node.parse_end, false) {
+            Ok(_) => {
+                // man-made horrors within our comprehension
+                my_node.value = Some(
+                    JType::Number(
+                        Number(match u64::from_str_radix(
+                            &ichars_to_string(
+                                &unwrap_arcslice(&src[my_node.parse_start+2..my_node.last_subnode_end()])
+                            ), 
+                            8
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return Err(format!("{}", e)),
+                        } as f64)
+                    )
+                );
+                return my_node.ok("OctalIntegerLiteral")
+            },
+            Err(e) => return Err(e),
+        }
+    }
+    my_node.err(src, "0o or 0O", 2)
+}
+
+/// # Errors
+/// Expects the first character of `src` to be a bit.
+pub fn parse_binary_digit(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.match_char(src, &['0' as u32, '1' as u32]) {
+        return my_node.ok("BinaryDigit");
+    }
+    my_node.err(src, "a binary digit", 1)
+}
+
+/// # Errors
+/// Expects `src` to begin with one or more bits.
+pub fn parse_binary_digits(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    match my_node.recurse(src, parse_binary_digit, 1, "one or more binary digits", 1) {
+        Ok(()) => my_node.ok("BinaryDigits"),
+        Err(e) => Err(e),
+    }
+}
+
+/// # Errors
+/// Expects `src` to be a binary integer literal.
+#[allow(clippy::cast_precision_loss)] // not much we can do about this
+pub fn parse_binary_integer_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.match_str(src, "0b") || my_node.match_str(src, "0B") {
+        match my_node.next_subnode(src, parse_binary_digits, my_node.parse_end, false) {
+            Ok(_) => {
+                // man-made horrors within our comprehension
+                my_node.value = Some(
+                    JType::Number(
+                        Number(match u64::from_str_radix(
+                            &ichars_to_string(
+                                &unwrap_arcslice(&src[my_node.parse_start+2..my_node.last_subnode_end()])
+                            ), 
+                            2
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return Err(format!("{}", e)),
+                        } as f64)
+                    )
+                );
+                return my_node.ok("BinaryIntegerLiteral")
+            },
+            Err(e) => return Err(e),
+        }
+    }
+    my_node.err(src, "0b or 0B", 2)
+}
+
+/// # Errors
+/// Expects `src` to be a binary, octal, or hexadecimal integer literal.
+pub fn parse_non_decimal_integer_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.next_subnode(src, parse_binary_integer_literal, my_node.parse_end, false).is_ok() ||
+        my_node.next_subnode(src, parse_octal_integer_literal, my_node.parse_end, false).is_ok() ||
+        my_node.next_subnode(src, parse_hex_integer_literal, my_node.parse_end, false).is_ok() {
+        my_node.value = my_node.last_subnode_value();
+        return my_node.ok("NonDecimalIntegerLiteral")
+    }
+    my_node.err(src, "a binary, octal, or hexadecimal integer literal", 1)
+}
+
+/// # Errors
+/// Expects `src` to be a signed integer.
+#[allow(clippy::missing_panics_doc)] // if we panic this is a bug
+pub fn parse_signed_integer(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    // ignoring result since the rest of the code is identical
+    my_node.match_char(src, &['+' as u32, '-' as u32]);
+    match my_node.next_subnode(src, parse_decimal_digits, my_node.parse_end, false) {
+        Ok(_) => {
+            let x = my_node.last_subnode_value().unwrap().number();
+
+            if *src[my_node.parse_start].read() == IChar::Scalar('-') {
+                my_node.value = Some(JType::Number(-x));
+            }
+            else {
+                my_node.value = Some(JType::Number(x));
+            }
+            my_node.ok("SignedInteger")
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// # Errors
+/// Expects the first character of `src` to be an
+/// exponent indicator ('e' or 'E'.)
+pub fn parse_exponent_indicator(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.match_char(src, &['e' as u32, 'E' as u32]) {
+        return my_node.ok("ExponentIndicator");
+    }
+    my_node.err(src, "an exponent indicator ('e' or 'E')", 1)
+}
+
+/// # Errors
+/// Expects `src` to be the exponent part of a number
+/// expressed in scientific notation.
+pub fn parse_exponent_part(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    match my_node.next_subnode(src, parse_exponent_indicator, my_node.curr_loc+1, false) {
+        Ok(_) => match my_node.next_subnode(src, parse_signed_integer, my_node.parse_end, false) {
+            Ok(_) => {
+                my_node.value = my_node.last_subnode_value();
+                my_node.ok("ExponentPart")
+            },
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// # Errors
+/// Expects the first character of `src` to be a decimal digit.
+pub fn parse_decimal_digit(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    let chars = [
+        0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037, 0x0038,
+        0x0039
+    ];
+
+    if my_node.match_char(src, &chars) {
+        return my_node.ok("DecimalDigit");
+    }
+    my_node.err(src, "a decimal digit", 1)
+}
+
+/// # Errors
+/// Expects `src` to be a sequence of decimal digits.
+#[allow(clippy::cast_precision_loss)] // not much we can do about this
+pub fn parse_decimal_digits(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    match my_node.recurse(src, parse_decimal_digit, 1, "one or more decimal digits", 1) {
+        Ok(()) => {
+            // man-made horrors within our comprehension
+            my_node.value = Some(
+                JType::Number(
+                    Number(match ichars_to_string(&unwrap_arcslice(&src[my_node.parse_start..my_node.last_subnode_end()])).parse::<u64>() {
+                        Ok(v) => v,
+                        Err(e) => return Err(format!("{}", e)),
+                    } as f64)
+                )
+            );
+            my_node.ok("DecimalDigits")
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// # Errors
+/// Expects `src` to be one of 'Infinity', decimal digits, or '.'.
+#[allow(clippy::missing_panics_doc)] // if we panic this is a bug
+#[allow(clippy::cast_precision_loss)] // not much we can do about this
+pub fn parse_str_unsigned_decimal_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.match_str(src, "Infinity") {
+        my_node.value = Some(JType::Number(Number(f64::INFINITY)));
+        return my_node.ok("StrUnsignedDecimalLiteral: 1");
+    }
+    if my_node.next_subnode(src, parse_decimal_digits, my_node.parse_end, false).is_ok() {
+        let a = my_node.last_subnode_value().unwrap().number();
+        let mut b = 0.0;
+        let mut n = 0;
+        let mut e = 0.0;
+
+        if DEBUG {
+            println!("StrUnsignedDecimalLiteral: src[my_node.curr_loc]: {}", src[my_node.curr_loc].read());
+        }
+        /*
+         * this next DecimalDigits is optional in the standard but
+         * next_subnode only returns Ok(true) if we've reached
+         * my_node.parse_end, which won't be the case if we have an
+         * exponent part. the easiest solution right now is to mark
+         * it as not optional and check that it returns Ok. this
+         * calls into question the utility and/or soundness of both
+         * the optional flag and the bool in the Ok but i don't want
+         * to open those cans of worms right now.
+         */
+        if my_node.match_char(src, &['.' as u32]) && my_node.next_subnode(src, parse_decimal_digits, my_node.parse_end, false).is_ok() {
+            b = *my_node.last_subnode_value().unwrap().number();
+            n = my_node.last_subnode_nsubs();
+        }
+        if my_node.next_subnode(src, parse_exponent_part, my_node.parse_end, true).unwrap() {
+            e = *my_node.last_subnode_value().unwrap().number();
+        }
+        if DEBUG {
+            println!("StrUnsignedDecimalLiteral: a: {}, b: {}, n: {}, e: {}", a, b, n, e);
+        }
+        my_node.value = Some(JType::Number((a + Number(b * 10.0_f64.powf(-(n as f64)))) * Number(10.0_f64.powf(e))));
+        return my_node.ok("StrUnsignedDecimalLiteral: 2");
+    }
+    if my_node.match_char(src, &['.' as u32]) {
+        match my_node.next_subnode(src, parse_decimal_digits, my_node.parse_end, false) {
+            Ok(_) => {
+                let b = my_node.last_subnode_value().unwrap().number();
+                let mut e = Number(0.0);
+                let n = my_node.last_subnode_nsubs();
+
+                if my_node.next_subnode(src, parse_exponent_part, my_node.parse_end, true).unwrap() {
+                    e = my_node.last_subnode_value().unwrap().number();
+                }
+                my_node.value = Some(JType::Number(b * Number(10.0_f64.powf(*(e - Number(n as f64))))));
+                return my_node.ok("StrUnsignedDecimalLiteral: 3");
+            },
+            Err(e) => return Err(e),
+        }
+    }
+    my_node.err(src, "one of 'Infinity', decimal digits, or '.'", "Infinity".len())
+}
+
+/// # Errors
+/// Expects `src` to be a decimal literal.
+#[allow(clippy::missing_panics_doc)] // if we panic this is a bug
+pub fn parse_str_decimal_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    // ignoring result since the rest of the code is identical
+    my_node.match_char(src, &['+' as u32, '-' as u32]);
+    match my_node.next_subnode(src, parse_str_unsigned_decimal_literal, my_node.parse_end, false) {
+        Ok(_) => {
+            if let JType::Number(a) = my_node.last_subnode_value().unwrap() && *src[my_node.parse_start].read() == IChar::Scalar('-') {
+                if *a == 0.0 && a.is_sign_positive() {
+                    my_node.value = Some(JType::Number(Number(-0.0)));
+                }
+                else {
+                    my_node.value = Some(JType::Number(-a));
+                }
+            }
+            else {
+                my_node.value = my_node.last_subnode_value();
+            }
+            my_node.ok("StrDecimalLiteral")
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// # Errors
+/// Expects `src` to be a numeric literal.
+pub fn parse_str_numeric_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    /*
+     * evaluated differently from the production list because we'd choke on the
+     * leading zero in non-decimal literals otherwise
+     */
+    if my_node.next_subnode(src, parse_non_decimal_integer_literal, my_node.parse_end, false).is_ok() ||
+        my_node.next_subnode(src, parse_str_decimal_literal, my_node.parse_end, false).is_ok() {
+        my_node.value = my_node.last_subnode_value();
+        return my_node.ok("StrNumericLiteral");
+    }
+    my_node.err(src, "numeric literal", 1)
+}
+
+/// # Errors
+/// Expects the first character of `src` to be a line terminator.
+pub fn parse_line_terminator(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    let chars = [0x000A, 0x000D, 0x2028, 0x2029];
+
+    if my_node.match_char(src, &chars) {
+        return my_node.ok("LineTerminator");
+    }
+    my_node.err(src, "line terminator", 1)
+}
+
+/// # Errors
+/// Expects the first character of `src` to be white space.
+pub fn parse_white_space(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    let chars = [
+        0x0009, 0x000B, 0x000C, 0xFEFF, 0x0020, 0x00A0, 0x1680, 0x2000, 0x2001,
+        0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A,
+        0x202F, 0x205F, 0x3000
+    ];
+
+    if my_node.match_char(src, &chars) {
+        return my_node.ok("WhiteSpace");
+    }
+    my_node.err(src, "white space", 1)
+}
+
+/// # Errors
+/// Expects the first character of `src` to be either white
+/// space or a line terminator.
+pub fn parse_str_white_space_char(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    if my_node.next_subnode(src, parse_white_space, my_node.parse_end, false).is_ok() ||
+        my_node.next_subnode(src, parse_line_terminator, my_node.parse_end, false).is_ok() {
+        return my_node.ok("StrWhiteSpaceChar");
+    }
+    my_node.err(src, "white space or line terminator", 1)
+}
+
+/// # Errors
+/// Expects `src` to be a sequence of white space or line terminators.
+pub fn parse_str_white_space(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    /*
+     * the semantics of this within the standard are different from other
+     * recursive functions. i'm not sure how much this matters, but as a result
+     * i am leaving this alone and not changing it to use recurse()
+     */
+    match my_node.next_subnode(src, parse_str_white_space_char, my_node.curr_loc+1, false) {
+        Ok(c) => if c {
+            return my_node.ok("StrWhiteSpace: 1");
+        },
+        Err(e) => return Err(e),
+    }
+    let _ = my_node.next_subnode(src, parse_str_white_space, my_node.parse_end, true);
+    my_node.ok("StrWhiteSpace: 2")
+}
+
+/// # Errors
+/// Expects `src` to be some form of numeric literal.
+#[allow(clippy::missing_panics_doc)] // if we panic this is a bug
+pub fn parse_string_numeric_literal(src: &List<IChar>, my_node: &mut ParseNode) -> Result<(), String> {
+    let mut subval = Some(JType::Number(Number(0.0)));
+    /*
+     * all elements of this production are optional, so the empty
+     * string/end of string is valid for once. handle it explicitly by
+     * checking curr_loc against src.size()
+     */
+    if my_node.next_subnode(src, parse_str_white_space, my_node.parse_end, true).unwrap() || my_node.curr_loc == src.size() {
+        my_node.value = subval;
+        return my_node.ok("StringNumericLiteral: 1");
+    }
+    match my_node.next_subnode(src, parse_str_numeric_literal, my_node.parse_end, false) {
+        Ok(_) => subval = my_node.last_subnode_value(),
+        Err(e) => return Err(e),
+    }
+    let _ = my_node.next_subnode(src, parse_str_white_space, my_node.parse_end, true);
+    my_node.value = subval;
+    my_node.ok("StringNumericLiteral: 2")
+}
+
+
+/// Parses a string using a specified parser.
+/// 
+/// # Errors
+/// Returns an error if the underlying parser fails, or if
+/// the string is not fully parsed.
+pub fn parse_text(src: &IString, goal: Parser) -> Result<ParseNode, String> {
+    let src = src.to_code_points();
+    let mut root_node = ParseNode {
+        subnodes: Vec::new(),
+        parser: goal,
+        parse_start: 0,
+        curr_loc: 0,
+        parse_end: src.size(),
+        value: None,
+    };
+
+    
+    match (root_node.parser)(&src, &mut root_node) {
+        Ok(()) => if root_node.parse_end == src.size() {
+            /*
+             * early error detection goes here somewhere. currently don't have
+             * any parsers that can generate these, so no way to handle yet
+             */
+            Ok(root_node)
+        } else {
+            Err(String::from("passed string wasn't parsed fully"))
+        },
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct Number(pub f64);
+
+impl Deref for Number {
+    type Target = f64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Neg for Number {
+    type Output = Number;
+
+    fn neg(self) -> Self::Output {
+        Number(-*self)
+    }
+}
+
+impl std::fmt::Display for Number {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Add for Number {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Number(*self + *rhs)
+    }
+}
+
+impl Mul for Number {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        Number(*self * *rhs)
+    }
+}
+
+impl Sub for Number {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Number(*self - *rhs)
+    }
+}
+
+impl Number {
+    #[must_use]
+    #[allow(clippy::float_cmp)] // we are testing for exact value matches here
+    pub fn same_value(&self, other: &Self) -> bool {
+        if self.0.is_nan() && other.0.is_nan() {
+            return true
+        }
+        if self.0 == 0.0 && other.0 == 0.0 &&
+            (self.0.is_sign_positive() && other.0.is_sign_negative()) &&
+            (self.0.is_sign_negative() && other.0.is_sign_positive()) {
+                return false
+        }
+        self.0 == other.0
+    }
+}
+
+/*
+Symbol tweaked from https://users.rust-lang.org/t/does-rust-have-something-like-symbol-in-javascript/128209/5
+*/
+
+#[derive(Debug)]
+pub struct Symbol {
+    me: Weak<Symbol>,
+    id: u64,
+    description: Option<IString>,
+}
+
+impl Symbol {
+    #[must_use]
+    pub fn new(desc: &Option<IString>) -> Arc<Self> {
+        static SYMBOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        Arc::new_cyclic(|me |
+            Symbol {
+                me: me.clone(),
+                id: SYMBOL_COUNTER.fetch_add(1, Ordering::Relaxed),
+                description: desc.clone(),
+            }
+        )
+    }
+
+    #[must_use]
+    pub fn description(&self) -> Option<IString> {
+        self.description.clone()
+    }
+
+    /*
+     * known symbols map to known object property values, but none of these are
+     * implemented yet. can still create the symbols themselves for now
+     */
+    #[allow(dead_code)] // until it comes alive
+    fn init_known_symbols() {
+        let mut syms = KNOWN_SYMBOLS.lock();
+        let names = [
+            "Symbol.asyncIterator",
+            "Symbol.hasInstance",
+            "Symbol.isConcatSpreadable",
+            "Symbol.iterator",
+            "Symbol.match",
+            "Symbol.matchAll",
+            "Symbol.replace",
+            "Symbol.search",
+            "Symbol.species",
+            "Symbol.split",
+            "Symbol.toPrimitive",
+            "Symbol.toStringTag",
+            "Symbol.unscopables"
+        ];
+
+        for s in names {
+            syms.set(s, Symbol::new(&Some(IString::from_str(s))));
+        }
+    }
+}
+
+impl PartialEq for Symbol {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.me, &other.me)
+    }
+}
+
+/*
+ * Keys must be Ord in order to be used with an Object's internal Map. Symbols
+ * are not themselves Ord, and will never be, so instead we implement Ord on
+ * the Key. The semantics are as follows:
+ * All Symbols are lesser than all Strings.
+ * Symbols will be ordered based on their internal id (and this may change
+ * between different incovations of the same program.)
+ * Strings will be ordered using IString::cmp().
+ */
+#[derive(Debug, Clone)]
+pub enum Key {
+    Symbol(Arc<Symbol>),
+    String(IString),
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::String(l0), Self::String(r0)) => l0 == r0,
+            (Self::Symbol(l0), Self::Symbol(r0)) => Arc::ptr_eq(l0, r0),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Key {}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self {
+            Key::Symbol(s_sym) => match other {
+                Key::Symbol(o_sym) => s_sym.id.cmp(&o_sym.id),
+                Key::String(_) => std::cmp::Ordering::Less,
+            },
+            Key::String(s_istring) => match other {
+                Key::Symbol(_) => std::cmp::Ordering::Greater,
+                Key::String(o_istring) => s_istring.cmp(o_istring),
+            },
+        }
+    }
+}
+
+impl Key {
+    #[must_use]
+    pub fn is_name(&self) -> bool {
+        match self {
+            Key::String(_) => true,
+            Key::Symbol(_) => false,
+        }
+    }
+
+    // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+    #[must_use]
+    pub fn is_int_index(&self) -> bool {
+        match self {
+            Key::String(_istring) => todo!(),
+            Key::Symbol(_) => false,
+        }
+    }
+
+    // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+    #[must_use]
+    pub fn is_array_index(&self) -> bool {
+        match self {
+            Key::String(_istring) => todo!(),
+            Key::Symbol(_) => false,
+        }
+    }
+}
+
+pub type Record<T> = Map<String, JAny<T>>;
+
+#[derive(Clone)]
+pub struct PropDesc {
+    value: Option<JType>,
+    writable: Option<bool>,
+    // must be Objects or JType::Undefined
+    get: Option<JType>,
+    set: Option<JType>,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+}
+
+pub const PROPDESC_DEFAULT: PropDesc = PropDesc {
+    value: Some(JType::Undefined),
+    writable: Some(false),
+    get: Some(JType::Undefined),
+    set: Some(JType::Undefined),
+    enumerable: Some(false),
+    configurable: Some(false),
+};
+
+impl std::fmt::Debug for PropDesc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PropDesc")
+        .field("value", &self.value)
+        .field("writable", &self.writable)
+        .field("get", &"some Object")
+        .field("set", &"some Object")
+        .field("enumerable", &self.enumerable)
+        .field("configurable", &self.configurable)
+        .finish()
+    }
+}
+
+impl PropDesc {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            value: None,
+            writable: None,
+            get: None,
+            set: None,
+            enumerable: None,
+            configurable: None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_accessor_descriptor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+
+    #[must_use]
+    pub fn is_data_descriptor(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+
+    #[must_use]
+    pub fn is_generic_descriptor(&self) -> bool {
+        !(self.is_accessor_descriptor() || self.is_data_descriptor())
+    }
+
+    pub fn complete_property_descriptor(&mut self) {
+        if self.is_generic_descriptor() || self.is_data_descriptor() {
+            if self.value.is_none() {
+                self.value = PROPDESC_DEFAULT.value;
+            }
+            if self.writable.is_none() {
+                self.writable = PROPDESC_DEFAULT.writable;
+            }
+        }
+        else {
+            if self.get.is_none() {
+                self.get = PROPDESC_DEFAULT.get;
+            }
+            if self.set.is_none() {
+                self.set = PROPDESC_DEFAULT.set;
+            }
+        }
+        if self.enumerable.is_none() {
+            self.enumerable = PROPDESC_DEFAULT.enumerable;
+        }
+        if self.configurable.is_none() {
+            self.configurable = PROPDESC_DEFAULT.configurable;
+        }
+    }
+
+    #[must_use]
+    pub fn is_fully_populated(&self) -> bool {
+        if self.is_accessor_descriptor() &&
+            self.get.is_some() && self.set.is_some() &&
+            self.enumerable.is_some() && self.configurable.is_some() {
+                return true;
+        }
+        if self.is_data_descriptor() &&
+            self.value.is_some() && self.writable.is_some() &&
+            self.enumerable.is_some() && self.configurable.is_some() {
+                return true;
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn no_fields(&self) -> bool {
+        !(self.value.is_some() || self.writable.is_some() ||
+        self.get.is_some() || self.set.is_some() ||
+        self.enumerable.is_some() || self.configurable.is_some())
+    }
+}
+
+impl Default for PropDesc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PrivElemKind {
+    Field,
+    Method,
+    Accessor,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // not everything is used yet
+pub struct PrivElem {
+    key: Arc<Symbol>,
+    kind: PrivElemKind,
+    value: Option<JType>,
+    get: Option<ArcRw<dyn Object>>,
+    set: Option<ArcRw<dyn Object>>,
+}
+
+impl std::fmt::Debug for PrivElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivElem")
+        .field("key", &self.key)
+        .field("kind", &self.kind)
+        .field("value", &self.value)
+        .field("get", &"some Object")
+        .field("set", &"some Object")
+        .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct ClassFieldDef {
+    record: Record<JAny<()>>,
+}
+
+impl Clone for ClassFieldDef {
+    fn clone(&self) -> Self {
+        Self { record: self.record.clone() }
+    }
+}
+
+impl Deref for ClassFieldDef {
+    type Target = Record<JAny<()>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
+impl DerefMut for ClassFieldDef {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.record
+    }
+}
+
+static OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+type Callfunc = fn(JType, List<JType>) -> Result<JType, Box<dyn Object>>;
+type Consfunc = fn(List<JType>) -> Result<ArcRw<dyn Object>, Box<dyn Object>>;
+
+#[allow(dead_code)] // not everything is used yet
+trait ObjectPriv {
+    fn get_private_elements(&self) -> &List<PrivElem>;
+
+    fn mut_private_elements(&mut self) -> &mut List<PrivElem>;
+    
+    fn get_proto(&self) -> Option<ArcRw<dyn Object>>;
+
+    fn set_proto(&mut self, proto: Option<ArcRw<dyn Object>>);
+
+    fn get_id(&self) -> u64;
+
+    fn get_extensible(&self) -> bool;
+
+    fn set_extensible(&mut self, val: bool);
+
+    // implementors of Object must tell us which functions they have overridden
+    fn get_overridden_methods(&self) -> [bool; 11];
+
+    fn call_overridden(&self) -> bool;
+    
+    fn construct_overridden(&self) -> bool;
+
+    fn get_me(&self) -> Weak<RwLock<dyn Object>>;
+
+    fn get_map(&self) -> &Map<Key, PropDesc>;
+
+    fn mut_map(&mut self) -> &mut Map<Key, PropDesc>;
+
+    fn get_call(&self) -> Option<Callfunc>;
+
+    fn get_constructor(&self) -> Option<Consfunc>;
+
+    fn as_trait(&self) -> &dyn Object;
+
+    fn as_mut_trait(&mut self) -> &mut dyn Object;
+
+    // just for std::fmt::Debug
+    fn get_name(&self) -> String;
+
+    fn is_constructor(&self) -> bool {
+        self.get_constructor().is_some()
+    }
+
+    fn is_function(&self) -> bool {
+        self.get_call().is_some()
+    }
+
+    fn next_id() -> u64
+    where
+        Self: Sized,
+    {
+        OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn is_ordinary(&self) -> bool {
+        for s in self.get_overridden_methods() {
+            if !s {
+                return false;
+            }
+        }
+        !(self.call_overridden() || self.construct_overridden())
+    }
+
+    fn is_exotic(&self) -> bool {
+        !self.is_ordinary()
+    }
+}
+
+#[allow(private_bounds)]
+pub trait Object: ObjectPriv + Send + Sync
+where
+    Self: 'static,
+    for<'a> &'a mut Self: PartialEq<dyn Object>,
+{
+    fn ordinary_get_prototype_of(&self) -> Option<ArcRw<dyn Object>> {
+        self.get_proto()
+    }
+
+    fn ordinary_set_prototype_of(&mut self, v: Option<ArcRw<dyn Object>>) -> bool {
+        let current = self.get_proto();
+
+        if let Some(ref p) = v && let Some(c) = current &&
+            Arc::ptr_eq(p, &c) {
+                return true;
+        }
+
+        let extensible = self.get_extensible();
+
+        if !extensible {
+            return false;
+        }
+
+        let mut p = v.clone();
+        let mut done = false;
+
+        while !done {
+            match p {
+                Some(ref am) => {
+                    if self == *am.read_arc_recursive() {
+                        return false
+                    }
+                    if am.read().get_overridden_methods()[0] {
+                        done = true;
+                    }
+                    else {
+                        p = am.clone().read().get_proto();
+                    }
+                },
+                None => done = true,
+            }
+        }
+        self.set_proto(v);
+        true
+    }
+
+    fn ordinary_is_extensible(&self) -> bool {
+        self.get_extensible()
+    }
+
+    fn ordinary_prevent_extensions(&mut self) -> bool {
+        self.set_extensible(false);
+        true
+    }
+
+    /*
+     * there may be a way to avoid this but i really don't feel like dealing
+     * with manual memory management at the moment.
+     * heap-allocated JTypes? (eugh)
+     * FIXME: low-hanging-fruit optimization
+     */
+    #[allow(clippy::assigning_clones)]
+    fn ordinary_get_own_property(&self, key: &Key) -> Option<PropDesc> {
+        let mut d = PropDesc::new();
+
+        match self.get_map().get(key) {
+            Some(x) => {
+                if x.is_data_descriptor() {
+                    d.value = x.value.clone();
+                    d.writable = x.writable;
+                }
+                else {
+                    assert!(x.is_accessor_descriptor());
+                    d.get = x.get.clone();
+                    d.set = x.set.clone();
+                }
+                d.enumerable = x.enumerable;
+                d.configurable = x.configurable;
+                Some(d)
+            },
+            None => None,
+        }
+    }
+
+    fn validate_and_apply_propdesc(&mut self, p: Key, extensible: bool, desc: &PropDesc, current: &Option<PropDesc>) -> bool {
+        if let Some(current) = current {
+            if let Some(b) = util::validate_propdesc(desc, current) {
+                return b;
+            }
+            let configurable = match desc.configurable {
+                Some(c) => c,
+                None => current.configurable.unwrap(),
+            };
+            let enumerable = match desc.enumerable {
+                Some(e) => e,
+                None => current.enumerable.unwrap(),
+            };
+            if current.is_data_descriptor() && desc.is_accessor_descriptor() {
+                self.mut_map().set(p, PropDesc {
+                    value: None,
+                    writable: None,
+                    get: match &desc.get {
+                        Some(g) => Some(g.clone()),
+                        None => PROPDESC_DEFAULT.get,
+                    },
+                    set: match &desc.set {
+                        Some(s) => Some(s.clone()),
+                        None => PROPDESC_DEFAULT.set,
+                    },
+                    enumerable: Some(enumerable),
+                    configurable: Some(configurable),
+                });
+            }
+            else if current.is_accessor_descriptor() && desc.is_data_descriptor() {
+                self.mut_map().set(p, PropDesc {
+                    value: match &desc.value {
+                        Some(v) => Some(v.clone()),
+                        None => PROPDESC_DEFAULT.value,
+                    },
+                    writable: match desc.writable {
+                        Some(w) => Some(w),
+                        None => PROPDESC_DEFAULT.writable,
+                    },
+                    get: None,
+                    set: None,
+                    enumerable: Some(enumerable),
+                    configurable: Some(configurable),
+                });
+            }
+            else {
+                self.mut_map().set(p, desc.clone());
+            }
+            return true;
+        }
+        if !extensible {
+            return false;
+        }
+        if desc.is_accessor_descriptor() {
+            self.mut_map().set(p, PropDesc {
+                value: None,
+                writable: None,
+                get: match &desc.get {
+                    Some(v) => Some(v.clone()),
+                    None => PROPDESC_DEFAULT.get,
+                },
+                set: match &desc.set {
+                    Some(v) => Some(v.clone()),
+                    None => PROPDESC_DEFAULT.set,
+                },
+                enumerable: match desc.enumerable {
+                    Some(v) => Some(v),
+                    None => PROPDESC_DEFAULT.enumerable,
+                },
+                configurable: match desc.configurable {
+                    Some(v) => Some(v),
+                    None => PROPDESC_DEFAULT.configurable,
+                },
+            });
+        }
+        else {
+            self.mut_map().set(p, PropDesc {
+                value: match &desc.value {
+                    Some(v) => Some(v.clone()),
+                    None => PROPDESC_DEFAULT.value,
+                },
+                writable: match desc.writable {
+                    Some(v) => Some(v),
+                    None => PROPDESC_DEFAULT.writable,
+                },
+                get: None,
+                set: None,
+                enumerable: match desc.enumerable {
+                    Some(v) => Some(v),
+                    None => PROPDESC_DEFAULT.enumerable,
+                },
+                configurable: match desc.configurable {
+                    Some(v) => Some(v),
+                    None => PROPDESC_DEFAULT.configurable,
+                },
+            });
+        }
+        true
+    }
+
+    /// The definition of `define_own_property` for ordinary objects.
+    /// 
+    /// # Errors
+    /// 
+    /// This can never fail within ordinary objects, but may return
+    /// an error if `get_own_property` or `is_extensible` have been
+    /// overridden within exotic objects.
+    fn ordinary_define_own_property(&mut self, p: Key, desc: &PropDesc) -> Result<bool, Box<dyn Object>> {
+        let current = self.get_own_property(&p)?;
+        let extensible = self.is_extensible()?;
+
+        Ok(self.validate_and_apply_propdesc(p, extensible, desc, &current))
+    }
+
+    /// The definition of `has_property` for ordinary objects.
+    /// 
+    /// # Errors
+    /// 
+    /// May return an error if `get_own_property` or `get_prototype_of` have
+    /// been overridden within exotic objects. May also return an error within
+    /// ordinary objects if they have an exotic object that overrides those
+    /// same methods (as well as `has_property`) within the prototype chain.
+    fn ordinary_has_property(&self, p: &Key) -> Result<bool, Box<dyn Object>> {
+        if self.get_own_property(p)?.is_some() {
+            return Ok(true);
+        }
+        if let Some(parent) = self.get_prototype_of()? {
+            return parent.read_recursive().has_property(p)
+        }
+        Ok(false)
+    }
+
+    /// The definition of `get` for ordinary objects.
+    /// 
+    /// # Errors
+    /// 
+    /// May return an error if `get_own_property` or `get_prototype_of` have
+    /// been overridden within exotic objects. May also return an error within
+    /// ordinary objects if they have an exotic object that overrides those
+    /// same methods (as well as `get`) within the prototype chain.
+    // TODO: what if recv is self?
+    fn ordinary_get(&self, p: &Key, recv: JType) -> Result<JType, Box<dyn Object>> {
+        match self.get_own_property(p)? {
+            Some(desc) => {
+                if desc.is_data_descriptor() {
+                    return Ok(desc.value.unwrap().clone());
+                }
+                assert!(desc.is_accessor_descriptor());
+
+                let getter = desc.get.unwrap().clone();
+
+                if let JType::Undefined = getter {
+                    return Ok(JType::Undefined);
+                }
+                // PENDING FULL IMPLEMENTATION: Caused implementation cycle!
+                todo!()
+            }
+            None => match self.get_prototype_of()? {
+                Some(parent) => parent.read_recursive().get(p, recv),
+                None => Ok(JType::Undefined),
+            }
+        }
+    }
+
+    /// Creates a new own data property within an object.
+    /// 
+    /// # Errors
+    /// 
+    /// May return an error within an exotic object if it overrides
+    /// `define_own_property`, `get_own_property`, or `is_extensible`.
+    fn create_data_property(&mut self, p: Key, v: JType) -> Result<bool, Box<dyn Object>> {
+        let new_desc = PropDesc {
+            value: Some(v),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(true),
+            configurable: Some(true),
+        };
+
+        self.define_own_property(p, &new_desc)
+    }
+
+    /// The guts of `ordinary_set`. The spec factors it out
+    /// like this, but I am not entirely sure why.
+    /// 
+    /// # Errors
+    /// 
+    /// May return an error within an exotic object if it
+    /// overrides `get_prototype_of`, within ordinary
+    /// objects if an exotic object exists within the
+    /// prototype chain whose `set` method has been
+    /// overridden, or if `recv` is an exotic object whose
+    /// `get_own_property` method has been overridden.
+    fn ordinary_set_with_own_descriptor(&mut self, p: Key, v: JType, recv: JType, mut own_desc: Option<PropDesc>) -> Result<bool, Box<dyn Object>> {
+        if own_desc.is_none() {
+            if let Some(parent) = self.get_prototype_of()? {
+                return parent.write().set(p, v, recv);
+            }
+            own_desc = Some(PropDesc {
+                value: Some(JType::Undefined),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(true),
+                configurable: Some(true),
+            });
+        }
+        if let Some(own_desc) = own_desc {
+            if own_desc.is_data_descriptor() {
+                if !own_desc.writable.unwrap() {
+                    return Ok(false);
+                }
+                match recv {
+                    JType::Object(receiver) => {
+                        let mut receiver = {
+                            if addr_eq(Arc::as_ptr(&receiver), self.get_me().as_ptr()) {
+                                self.as_mut_trait()
+                            }
+                            else {
+                                &mut *receiver.write_arc()
+                            }
+                        };
+
+                        if let Some(existing_descriptor) = receiver.get_own_property(&p)? {
+                            if existing_descriptor.is_accessor_descriptor() {
+                                return Ok(false);
+                            }
+                            if !existing_descriptor.writable.unwrap() {
+                                return Ok(false);
+                            }
+
+                            return receiver.define_own_property(p, &PropDesc {
+                                value: Some(v),
+                                writable: None,
+                                get: None,
+                                set: None,
+                                enumerable: None,
+                                configurable: None,
+                            });
+                        }
+                        assert!(receiver.get_map().contains_key(&p).is_none());
+                        return receiver.create_data_property(p, v);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            assert!(own_desc.is_accessor_descriptor());
+            match own_desc.set {
+                Some(_setter) => {
+                    // PENDING FULL IMPLEMENTATION: Caused implementation cycle!
+                    todo!()
+                },
+                None => return Ok(false),
+            }
+            //todo!()
+        }
+        todo!()
+    }
+
+    /// The definition of `set` for ordinary objects.
+    /// 
+    /// # Errors
+    /// 
+    /// May return an error within exotic objects if `get_own_property` is
+    /// overridden. May return further errors as described by the documentation
+    /// of `ordinary_set_with_own_descriptor.`
+    fn ordinary_set(&mut self, p: Key, v: JType, recv: JType) -> Result<bool, Box<dyn Object>> {
+        let own_desc = self.get_own_property(&p)?;
+
+        self.ordinary_set_with_own_descriptor(p, v, recv, own_desc)
+    }
+
+    /// The definition of `delete` for ordinary objects.
+    /// 
+    /// # Errors
+    /// 
+    /// May return an error within exotic objects if `get_own_property` is
+    /// overridden.
+    fn ordinary_delete(&mut self, p: &Key) -> Result<bool, Box<dyn Object>> {
+        match self.get_own_property(p)? {
+            Some(desc) => {
+                if desc.configurable.unwrap() {
+                    self.mut_map().remove(|(key, _)| *key.read() == *p);
+                    return Ok(true)
+                }
+                Ok(false)
+            },
+            None => Ok(true),
+        }
+    }
+
+    fn ordinary_own_property_keys(&self) -> List<ArcRw<Key>> {
+        // can't use these variables until we can implement
+        //let mut index_keys = List::new();
+        //let mut string_keys = List::new();
+        let mut symbol_keys = List::new();
+        let keys = List::new();
+
+        for key in self.get_map().get_keys().iter() {
+            match (*key.read()).clone() {
+                Key::Symbol(_) => symbol_keys.append_arc(key.clone()),
+                // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+                Key::String(_istring) => todo!(),
+            }
+        }        
+        keys
+    }
+
+    fn define_property_or_throw(&mut self, p: Key, desc: &PropDesc) -> Result<(), Box<dyn Object>> {
+        if !self.define_own_property(p, desc)? {
+            // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+            todo!()
+        }
+        todo!()
+    }
+
+    fn has_own_property(&self, p: &Key) -> Result<bool, Box<dyn Object>> {
+        if self.get_own_property(p)?.is_none() {
+            return Ok(false)
+        }
+        Ok(true)
+    }
+
+    /*
+     * the default implementations of all these will never fail unless exotic
+     * objects override (and those errors are already documented within the
+     * ordinary versions), so silencing the errors warning here
+     */
+    #[allow(clippy::missing_errors_doc)]
+    fn get_prototype_of(&self) -> Result<Option<ArcRw<dyn Object>>, Box<dyn Object>> {
+        Ok(self.ordinary_get_prototype_of())
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn set_prototype_of(&mut self, v: Option<ArcRw<dyn Object>>) -> Result<bool, Box<dyn Object>> {
+        Ok(self.ordinary_set_prototype_of(v))
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn is_extensible(&self) -> Result<bool, Box<dyn Object>> {
+        Ok(self.ordinary_is_extensible())
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn prevent_extensions(&mut self) -> Result<bool, Box<dyn Object>> {
+        Ok(self.ordinary_prevent_extensions())
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn get_own_property(&self, key: &Key) -> Result<Option<PropDesc>, Box<dyn Object>> {
+        Ok(self.ordinary_get_own_property(key))
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn define_own_property(&mut self, p: Key, desc: &PropDesc) -> Result<bool, Box<dyn Object>> {
+        self.ordinary_define_own_property(p, desc)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn has_property(&self, key: &Key) -> Result<bool, Box<dyn Object>> {
+        self.ordinary_has_property(key)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn get(&self, key: &Key, recv: JType) -> Result<JType, Box<dyn Object>> {
+        self.ordinary_get(key, recv)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn set(&mut self, key: Key, value: JType, recv: JType) -> Result<bool, Box<dyn Object>>{
+        self.ordinary_set(key, value, recv)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn delete(&mut self, key: &Key) -> Result<bool, Box<dyn Object>> {
+        self.ordinary_delete(key)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn own_property_keys(&self) -> Result<List<ArcRw<Key>>, Box<dyn Object>> {
+        Ok(self.ordinary_own_property_keys())
+    }
+}
+
+impl PartialEq for dyn Object {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_id() == other.get_id()
+    }
+}
+
+impl<'a> PartialEq<(dyn Object + 'static)> for &'a mut (dyn Object + 'static) {
+    fn eq(&self, other: &(dyn Object + 'static)) -> bool {
+        self.get_id() == other.get_id()
+    }
+}
+
+impl std::fmt::Debug for dyn Object {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get_name())
+    }
+}
+
+pub trait EnvRecord {
+    fn get_outer_env(&self) -> Option<ArcRw<dyn EnvRecord>>;
+
+    fn mut_outer_env(&mut self) -> Option<&mut ArcRw<dyn EnvRecord>>;
+
+    fn has_binding(&self, n: &IString) -> Result<bool, Box<dyn Object>>;
+
+    fn create_mutable_binding(&mut self, n: &IString, d: bool) -> Result<(), Box<dyn Object>>;
+
+    fn create_immutable_binding(&mut self, n: &IString, s: bool) -> Result<(), Box<dyn Object>>;
+
+    fn initialize_binding(&mut self, n: &IString, v: JType) -> Result<(), Box<dyn Object>>;
+
+    fn set_mutable_binding(&mut self, n: &IString, v: JType, s: bool) -> Result<(), Box<dyn Object>>;
+
+    fn get_binding_value(&self, n: &IString, s: bool) -> Result<JType, Box<dyn Object>>;
+
+    fn delete_binding(&mut self, n: &IString) -> Result<bool, Box<dyn Object>>;
+
+    fn has_this_binding(&self) -> bool;
+
+    fn get_this_binding(&self) -> Result<JType, Box<dyn Object>>;
+
+    fn has_super_binding(&self) -> bool;
+
+    fn with_base_object(&self) -> Option<ArcRw<dyn Object>>;
+}
+
+/*
+ * note: the implementation of this acts as if all string properties in
+ * binding_object are part of the record. this is technically wrong, only
+ * strings that are also valid IdentifierNames are included per the spec. but
+ * since i am ignoring Javascript parsing details for right now, i am ignoring
+ * this.
+ * FIXME: restrict to valid IdentifierNames
+ */
+pub struct ObjectEnv {
+    outer_env: Option<ArcRw<dyn EnvRecord>>,
+    binding_object: ArcRw<dyn Object>,
+    is_with_environment: bool,
+}
+
+impl EnvRecord for ObjectEnv {
+    fn get_outer_env(&self) -> Option<ArcRw<dyn EnvRecord>> {
+        self.outer_env.clone()
+    }
+
+    fn mut_outer_env(&mut self) -> Option<&mut ArcRw<dyn EnvRecord>> {
+        self.outer_env.as_mut()
+    }
+
+    fn has_binding(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        let binding_object = self.binding_object.read();
+        
+        if !binding_object.has_property(&Key::String(n.clone()))? {
+            return Ok(false);
+        }
+        if !self.is_with_environment {
+            return Ok(true);
+        }
+        /*
+         * none of the KNOWN_SYMBOLS properties are implemented yet but there
+         * is nothing stopping us from writing this code now
+         */
+        let known_symbols = KNOWN_SYMBOLS.lock();
+        if known_symbols.is_empty() {
+            Symbol::init_known_symbols();
+        }
+        if let JType::Object(unscopables) = binding_object.get(
+            &Key::Symbol(known_symbols.get(&"Symbol.unscopables").unwrap()), JType::Object(self.binding_object.clone())
+        )? {
+            if unscopables.read().get(&Key::String(n.clone()), JType::Object(unscopables.clone()))?.to_boolean() {
+                return Ok(false)
+            }
+        }
+        Ok(true)
+    }
+
+    fn create_mutable_binding(&mut self, n: &IString, d: bool) -> Result<(), Box<dyn Object>> {
+        self.binding_object.write().define_property_or_throw(Key::String(n.clone()), &PropDesc {
+            value: Some(JType::Undefined),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(true),
+            configurable: Some(d),
+        })
+    }
+
+    fn create_immutable_binding(&mut self, _n: &IString, _s: bool) -> Result<(), Box<dyn Object>> {
+        // spec never uses this
+        unimplemented!()
+    }
+
+    fn initialize_binding(&mut self, n: &IString, v: JType) -> Result<(), Box<dyn Object>> {
+        self.set_mutable_binding(n, v, false)
+    }
+
+    fn set_mutable_binding(&mut self, n: &IString, v: JType, s: bool) -> Result<(), Box<dyn Object>> {
+        let binding_object = self.binding_object.write();
+
+        if !binding_object.has_property(&Key::String(n.clone()))? && s {
+            // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+            todo!()
+        }
+        todo!()
+    }
+
+    fn get_binding_value(&self, n: &IString, s: bool) -> Result<JType, Box<dyn Object>> {
+        let binding_object = self.binding_object.read();
+
+        if !binding_object.has_property(&Key::String(n.clone()))? {
+            if !s {
+                return Ok(JType::Undefined)
+            }
+            // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+            todo!()
+        }
+        todo!()
+    }
+
+    fn delete_binding(&mut self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        self.binding_object.write().delete(&Key::String(n.clone()))
+    }
+
+    fn has_this_binding(&self) -> bool {
+        false
+    }
+
+    fn get_this_binding(&self) -> Result<JType, Box<dyn Object>> {
+        // spec never uses this
+        unimplemented!()
+    }
+
+    fn has_super_binding(&self) -> bool {
+        false
+    }
+
+    fn with_base_object(&self) -> Option<ArcRw<dyn Object>> {
+        if self.is_with_environment {
+            return Some(self.binding_object.clone())
+        }
+        None
+    }
+}
+
+pub struct IndirectBinding {
+    target_mod: ArcRw<dyn ModuleRec>,
+    bind_key: IString,
+}
+
+impl Clone for IndirectBinding {
+    fn clone(&self) -> Self {
+        Self {
+            target_mod: self.target_mod.clone(),
+            bind_key: self.bind_key.clone(),
+        }
+    }
+}
+
+pub enum BindingType {
+    None, // uninitialized
+    Direct(JType),
+    Indirect(IndirectBinding),
+}
+
+impl Clone for BindingType {
+    fn clone(&self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::Direct(arg0) => Self::Direct(arg0.clone()),
+            Self::Indirect(arg0) => Self::Indirect(arg0.clone()),
+        }
+    }
+}
+
+impl BindingType {
+    pub fn is_none(&self) -> bool {
+        match self {
+            Self::None => true,
+            _ => false,
+        }
+    }
+}
+
+/*
+ * not a specification type, but contains things marked as "to be recorded"
+ * within a DeclarativeEnv. spec doesn't say how, probably impl-defined
+ */
+pub struct BindingDesc {
+    val: BindingType, // if not initialized, is BindingValType::None
+    is_mut: bool,
+    can_delete: bool,
+    is_strict: bool,
+}
+
+impl Clone for BindingDesc {
+    fn clone(&self) -> Self {
+        Self {
+            val: self.val.clone(),
+            is_mut: self.is_mut,
+            can_delete: self.can_delete,
+            is_strict: self.is_strict,
+        }
+    }
+}
+
+pub trait DeclarativeEnvRecord: EnvRecord {
+    fn get_bindings(&self) -> &Map<IString, BindingDesc>;
+
+    fn mut_bindings(&mut self) -> &mut Map<IString, BindingDesc>;
+
+    fn der_has_binding(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        Ok(self.get_bindings().contains_key(n).is_some())
+    }
+
+    fn der_create_mutable_binding(&mut self, n: &IString, d: bool) -> Result<(), Box<dyn Object>> {
+        assert!(self.get_bindings().contains_key(n).is_none());
+
+        Ok(self.mut_bindings().set(n.clone(), BindingDesc {
+            val: BindingType::None,
+            is_mut: true,
+            can_delete: d,
+            is_strict: false,
+        }))
+    }
+
+    fn der_create_immutable_binding(&mut self, n: &IString, s: bool) -> Result<(), Box<dyn Object>> {
+        assert!(self.get_bindings().contains_key(n).is_none());
+
+        Ok(self.mut_bindings().set(n.clone(), BindingDesc {
+            val: BindingType::None,
+            is_mut: true,
+            can_delete: false,
+            is_strict: s,
+        }))
+    }
+
+    fn der_initialize_binding(&mut self, n: &IString, v: JType) -> Result<(), Box<dyn Object>> {
+        let desc = self.get_bindings().get(n).unwrap();
+
+        assert!(desc.val.is_none());
+
+        Ok(self.mut_bindings().set(n.clone(), BindingDesc {
+            val: BindingType::Direct(v.clone()),
+            is_mut: desc.is_mut,
+            can_delete: desc.can_delete,
+            is_strict: desc.is_strict,
+        }))
+    }
+
+    fn der_set_mutable_binding(&mut self, n: &IString, v: JType, s: bool) -> Result<(), Box<dyn Object>> {
+        if let Some(binding) = self.get_bindings().get(n) {
+            todo!()
+        }
+        if s {
+            // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+            todo!()
+        }
+        todo!()
+    }
+
+    fn der_get_binding_value(&self, n: &IString, s: bool) -> Result<JType, Box<dyn Object>> {
+        let binding = self.get_bindings().get(n).unwrap();
+
+        if binding.val.is_none() {
+            // PENDING FULL IMPLEMENTATION - Caused implementatin cycle!
+            todo!()
+        }
+        todo!()
+    }
+
+    fn der_delete_binding(&mut self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        let binding = self.get_bindings().get(n).unwrap();
+
+        if binding.can_delete {
+            self.mut_bindings().remove(|(x, _)| *x.read() == *n);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn der_has_this_binding(&self) -> bool {
+        false
+    }
+
+    fn der_get_this_binding(&self) -> Result<JType, Box<dyn Object>> {
+        // spec never uses this
+        unimplemented!()
+    }
+
+    fn der_has_super_binding(&self) -> bool {
+        false
+    }
+
+    fn der_with_base_object(&self) -> Option<ArcRw<dyn Object>> {
+        None
+    }
+}
+
+pub struct DeclarativeEnv {
+    outer_env: Option<ArcRw<dyn EnvRecord>>,
+    bindings: Map<IString, BindingDesc>, 
+}
+
+impl DeclarativeEnvRecord for DeclarativeEnv {
+    fn get_bindings(&self) -> &Map<IString, BindingDesc> {
+        &self.bindings
+    }
+
+    fn mut_bindings(&mut self) -> &mut Map<IString, BindingDesc> {
+        &mut self.bindings
+    }
+}
+
+impl EnvRecord for DeclarativeEnv {
+    fn get_outer_env(&self) -> Option<ArcRw<dyn EnvRecord>> {
+        self.outer_env.clone()
+    }
+
+    fn mut_outer_env(&mut self) -> Option<&mut ArcRw<dyn EnvRecord>> {
+        self.outer_env.as_mut()
+    }
+
+    fn has_binding(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        self.der_has_binding(n)
+    }
+
+    fn create_mutable_binding(&mut self, n: &IString, d: bool) -> Result<(), Box<dyn Object>> {
+        self.der_create_mutable_binding(n, d)
+    }
+
+    fn create_immutable_binding(&mut self, n: &IString, s: bool) -> Result<(), Box<dyn Object>> {
+        self.der_create_immutable_binding(n, s)
+    }
+
+    fn initialize_binding(&mut self, n: &IString, v: JType) -> Result<(), Box<dyn Object>> {
+        self.der_initialize_binding(n, v)
+    }
+
+    fn set_mutable_binding(&mut self, n: &IString, v: JType, s: bool) -> Result<(), Box<dyn Object>> {
+        self.der_set_mutable_binding(n, v, s)
+    }
+
+    fn get_binding_value(&self, n: &IString, s: bool) -> Result<JType, Box<dyn Object>> {
+        self.der_get_binding_value(n, s)
+    }
+
+    fn delete_binding(&mut self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        self.der_delete_binding(n)
+    }
+
+    fn has_this_binding(&self) -> bool {
+        self.der_has_this_binding()
+    }
+
+    fn get_this_binding(&self) -> Result<JType, Box<dyn Object>> {
+        self.der_get_this_binding()
+    }
+
+    fn has_super_binding(&self) -> bool {
+        self.der_has_super_binding()
+    }
+
+    fn with_base_object(&self) -> Option<ArcRw<dyn Object>> {
+        self.der_with_base_object()
+    }
+}
+
+pub struct GlobalEnv {
+    outer_env: Option<ArcRw<dyn EnvRecord>>,
+    object_record: ObjectEnv,
+    global_this_value: ArcRw<dyn Object>,
+    declarative_record: DeclarativeEnv,
+}
+
+impl EnvRecord for GlobalEnv {
+    fn get_outer_env(&self) -> Option<ArcRw<dyn EnvRecord>> {
+        self.outer_env.clone()
+    }
+
+    fn mut_outer_env(&mut self) -> Option<&mut ArcRw<dyn EnvRecord>> {
+        self.outer_env.as_mut()
+    }
+
+    fn has_binding(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        if self.declarative_record.has_binding(n).unwrap() {
+            return Ok(true);
+        }
+        self.object_record.has_binding(n)
+    }
+
+    fn create_mutable_binding(&mut self, n: &IString, d: bool) -> Result<(), Box<dyn Object>> {
+        if self.declarative_record.has_binding(n).unwrap() {
+            // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+            todo!()
+        }
+        todo!()
+    }
+
+    fn create_immutable_binding(&mut self, n: &IString, s: bool) -> Result<(), Box<dyn Object>> {
+        if self.declarative_record.has_binding(n).unwrap() {
+            // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+            todo!()
+        }
+        todo!()
+    }
+
+    fn initialize_binding(&mut self, n: &IString, v: JType) -> Result<(), Box<dyn Object>> {
+        if self.declarative_record.has_binding(n).unwrap() {
+            return self.declarative_record.initialize_binding(n, v)
+        }
+        assert!(self.object_record.has_binding(n).unwrap());
+        self.object_record.initialize_binding(n, v)
+    }
+
+    fn set_mutable_binding(&mut self, n: &IString, v: JType, s: bool) -> Result<(), Box<dyn Object>> {
+        if self.declarative_record.has_binding(n).unwrap() {
+            return self.declarative_record.set_mutable_binding(n, v, s)
+        }
+        self.object_record.set_mutable_binding(n, v, s)
+    }
+
+    fn get_binding_value(&self, n: &IString, s: bool) -> Result<JType, Box<dyn Object>> {
+        if self.declarative_record.has_binding(n).unwrap() {
+            return self.declarative_record.get_binding_value(n, s)
+        }
+        self.object_record.get_binding_value(n, s)
+    }
+
+    fn delete_binding(&mut self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        if self.declarative_record.has_binding(n).unwrap() {
+            return self.declarative_record.delete_binding(n)
+        }
+        if self.object_record.binding_object.read().has_own_property(&Key::String(n.clone()))? {
+            return self.object_record.delete_binding(n)
+        }
+        Ok(true)
+    }
+
+    fn has_this_binding(&self) -> bool {
+        true
+    }
+
+    fn get_this_binding(&self) -> Result<JType, Box<dyn Object>> {
+        Ok(JType::Object(self.global_this_value.clone()))
+    }
+
+    fn has_super_binding(&self) -> bool {
+        false
+    }
+
+    fn with_base_object(&self) -> Option<ArcRw<dyn Object>> {
+        None
+    }
+}
+
+impl GlobalEnv {
+    pub fn has_lexical_declaration(&self, n: &IString) -> bool {
+        self.declarative_record.has_binding(n).unwrap()
+    }
+
+    pub fn has_restricted_global_property(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        if let Some(existing_prop) = self.object_record.binding_object.read().get_own_property(&Key::String(n.clone()))? {
+            if existing_prop.configurable.unwrap() {
+                return Ok(false)
+            }
+            return Ok(true)
+        }
+        Ok(false)
+    }
+
+    pub fn can_declare_global_var(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        let global_object = self.object_record.binding_object.read();
+
+        if global_object.has_own_property(&Key::String(n.clone()))? {
+            return Ok(true)
+        }
+        global_object.is_extensible()
+    }
+
+    pub fn can_declare_global_function(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        let global_object = self.object_record.binding_object.read();
+
+        if let Some(existing_prop) = global_object.get_own_property(&Key::String(n.clone()))? {
+            if existing_prop.configurable.unwrap() {
+                return Ok(true);
+            }
+            if existing_prop.is_data_descriptor() && existing_prop.writable.unwrap() && existing_prop.enumerable.unwrap() {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        global_object.is_extensible()
+    }
+
+    pub fn create_global_var_binding(&mut self, n: &IString, d: bool) -> Result<(), Box<dyn Object>> {
+        let mut obj_rec = &mut self.object_record;
+        let my_arc = obj_rec.binding_object.clone();
+        let global_object = my_arc.read();
+
+        if !global_object.has_own_property(&Key::String(n.clone()))? && global_object.is_extensible()? {
+            obj_rec.create_mutable_binding(n, d)?;
+            obj_rec.initialize_binding(n, JType::Undefined)?;
+        }
+        Ok(())
+    }
+
+    /*
+     * an interesting observation the borrow checker found: we initialize desc
+     * using v, then we create a property within the global object using desc
+     * via define_property_or_throw(). the spec then has us use v _AGAIN_, via
+     * set(). this, of course, results in a second (invalid) move of the value.
+     * regardless of memory safety, it showed that the algorithm is setting the
+     * value within the property more than it needs to.
+     * unfortunately, i cannot go into further detail since as of this writing
+     * (5/2/2026) define_property_or_throw is not fully implemented.
+     * going to clone() v for now until we can fix
+     * TODO: FIXME: optimize based on above observation
+     */
+    pub fn create_global_function_binding(&mut self, n: &IString, v: JType, d: bool) -> Result<(), Box<dyn Object>> {
+        let mut global_object = self.object_record.binding_object.write();
+        /*
+         * note: this is an inversion of the algorithm described in the
+         * standard but it produces the same result while also composing better
+         */
+        let desc = if let Some(existing_prop) = global_object.get_own_property(&Key::String(n.clone()))? && !existing_prop.configurable.unwrap() {
+            PropDesc {
+                value: Some(v.clone()),
+                writable: None,
+                get: None,
+                set: None,
+                enumerable: None,
+                configurable: None,
+            }
+        }
+        /*
+         * we don't care about existing_prop being defined anymore; if it is it
+         * must be configurable and the logic is the same
+         */
+        else {
+            PropDesc {
+                value: Some(v.clone()),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(true),
+                configurable: Some(d),
+            }
+        };
+
+        global_object.define_property_or_throw(Key::String(n.clone()), &desc)?;
+        global_object.set(Key::String(n.clone()), v, JType::Bool(false))?;
+        Ok(())
+    }
+}
+
+pub struct NodeToArr {
+    site: ParseNode, // TemplateLiteral
+    // Array Object. causes implementation cycle because a constructor is needed
+    // TODO: PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+    array: Box<dyn Object>,
+}
+
+#[derive(PartialEq)]
+pub struct ImportAttribute {
+    key: IString,
+    value: IString,
+}
+
+pub struct ModuleEnv {
+    outer_env: Option<ArcRw<dyn EnvRecord>>,
+    bindings: Map<IString, BindingDesc>, 
+}
+
+impl DeclarativeEnvRecord for ModuleEnv {
+    fn get_bindings(&self) -> &Map<IString, BindingDesc> {
+        &self.bindings
+    }
+
+    fn mut_bindings(&mut self) -> &mut Map<IString, BindingDesc> {
+        &mut self.bindings
+    }
+}
+
+impl EnvRecord for ModuleEnv {
+    fn get_outer_env(&self) -> Option<ArcRw<dyn EnvRecord>> {
+        self.outer_env.clone()
+    }
+
+    fn mut_outer_env(&mut self) -> Option<&mut ArcRw<dyn EnvRecord>> {
+        self.outer_env.as_mut()
+    }
+
+    fn has_binding(&self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        self.der_has_binding(n)
+    }
+
+    fn create_mutable_binding(&mut self, n: &IString, d: bool) -> Result<(), Box<dyn Object>> {
+        self.der_create_mutable_binding(n, d)
+    }
+
+    fn create_immutable_binding(&mut self, n: &IString, s: bool) -> Result<(), Box<dyn Object>> {
+        self.der_create_immutable_binding(n, s)
+    }
+
+    fn initialize_binding(&mut self, n: &IString, v: JType) -> Result<(), Box<dyn Object>> {
+        self.der_initialize_binding(n, v)
+    }
+
+    fn set_mutable_binding(&mut self, n: &IString, v: JType, s: bool) -> Result<(), Box<dyn Object>> {
+        self.der_set_mutable_binding(n, v, s)
+    }
+
+    fn get_binding_value(&self, n: &IString, s: bool) -> Result<JType, Box<dyn Object>> {
+        // different def from DeclarativeEnv
+        assert!(s);
+        assert!(self.bindings.contains_key(n).is_some());
+
+        match self.bindings.get(n).unwrap().val {
+            BindingType::None => todo!(),
+            BindingType::Direct(jtype) => todo!(),
+            BindingType::Indirect(ptr) => {
+                if let Some(target_env) = ptr.target_mod.read().get_environment() {
+                    return target_env.read().get_binding_value(&ptr.bind_key, true)
+                }
+                // throw ReferenceError - needs constructor
+                // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+                todo!()
+            },
+        }
+    }
+
+    fn delete_binding(&mut self, n: &IString) -> Result<bool, Box<dyn Object>> {
+        // different def from DeclarativeEnv
+        // spec never uses this
+        unimplemented!()
+    }
+
+    fn has_this_binding(&self) -> bool {
+        // different def from DeclarativeEnv
+        true
+    }
+
+    fn get_this_binding(&self) -> Result<JType, Box<dyn Object>> {
+        // different def from DeclarativeEnv
+        Ok(JType::Undefined)
+    }
+
+    fn has_super_binding(&self) -> bool {
+        self.der_has_super_binding()
+    }
+
+    fn with_base_object(&self) -> Option<ArcRw<dyn Object>> {
+        self.der_with_base_object()
+    }
+}
+
+impl ModuleEnv {
+    pub fn create_import_binding(&mut self, n: &IString, m: ArcRw<dyn ModuleRec>, n2: &IString) {
+        assert!(self.bindings.contains_key(n).is_none());
+
+        self.bindings.set(n.clone(), BindingDesc {
+            val: BindingType::Indirect(IndirectBinding {
+                target_mod: m.clone(),
+                bind_key: n2.clone(),
+            }),
+            is_mut: false,
+            can_delete: false,
+            is_strict: false,
+        })
+    }
+}
+
+pub struct PromiseCapability {
+    // a promise object - not yet implemented
+    // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+    promise: ArcRw<dyn Object>,
+    // function objects - _also_ not yet implemented
+    resolve: Box<dyn Object>,
+    reject: Box<dyn Object>,
+}
+
+impl PromiseCapability {
+    pub fn new(c: JType) -> Result<Self, Box<dyn Object>> {
+        if !c.is_constructor() {
+            // PENDING FULL IMPLEMENTATION: Caused implementation cycle!
+            todo!()
+        }
+        todo!()
+    }
+}
+
+pub struct GraphLoadingState {
+    promise_capability: PromiseCapability,
+    is_loading: bool,
+    pending_modules_count: usize,
+    visited: List<dyn CyclicModuleRec>,
+    host_defined: Option<Box<dyn Any>>,
+}
+
+fn host_get_supported_import_attributes() -> List<IString> {
+    List::new()
+}
+
+impl List<ImportAttribute> {
+    pub fn all_import_attributes_supported(&self) -> bool {
+        let supported = host_get_supported_import_attributes();
+
+        for attribute in self.iter() {
+            if supported.contains(&attribute.read().key).is_none() {
+                return false
+            }
+        }
+        true
+    }
+}
+
+impl GraphLoadingState {
+    pub fn inner_module_loading(&mut self, module: &mut dyn ModuleRec) {
+        assert!(self.is_loading);
+
+        if let Some(module) = module.is_cyclic_mut() &&
+            module.get_status() == CyclicStatus::New &&
+            self.visited.contains_weak(&module.get_me()).is_none() {
+                self.visited.append_arc(module.get_me().upgrade().unwrap());
+                self.pending_modules_count += module.get_requested_modules().size();
+                for request in module.get_requested_modules().iter() {
+                    // read() call may become write()
+                    if !request.read().attributes.all_import_attributes_supported() {
+                        // needs to be Err(SyntaxErr)
+                        // PENDING FULL IMPLEMENTATION - Caused implementaton cycle!
+                        todo!()
+                    }
+                }
+        }
+    }
+}
+
+pub struct ModuleRequest {
+    specifier: IString,
+    // would love to make this a map but we can't implement partialeq on maps
+    attributes: List<ImportAttribute>,
+}
+
+impl PartialEq for ModuleRequest {
+    fn eq(&self, other: &Self) -> bool {
+        if self.specifier != other.specifier && self.attributes.size() != other.attributes.size() {
+            return false
+        }
+        for l in self.attributes.iter() {
+            if other.attributes.contains(&*l.read()).is_none() {
+                return false
+            }
+        }
+        true
+    }
+}
+
+#[derive(PartialEq)]
+pub enum CyclicStatus {
+    New,
+    Unlinked,
+    Linking,
+    Linked,
+    Evaluating,
+    EvaluatingAsync,
+    Evaluated,
+}
+
+#[derive(PartialEq)]
+pub enum AsyncEvalOrder {
+    Unset,
+    Position(usize),
+    Done,
+}
+
+pub trait CyclicModuleRec: ModuleRec {
+    fn initialize_environment(&mut self) -> Result<(), Box<dyn Object>>;
+
+    fn execute_module(&self, capability: Option<PromiseCapability>) -> Result<(), Box<dyn Object>>;
+
+    // keyword collision. bleh. otherwise would just be abstract()
+    fn as_abstract(&self) -> &dyn ModuleRec;
+
+    fn as_mut_abstract(&mut self) -> &mut dyn ModuleRec;
+
+    fn as_trait(&self) -> &dyn CyclicModuleRec;
+
+    fn as_mut_trait(&mut self) -> &mut dyn CyclicModuleRec;
+
+    fn get_me(&self) -> Weak<RwLock<dyn CyclicModuleRec>>;
+
+    fn get_status(&self) -> CyclicStatus;
+
+    fn get_requested_modules(&self) -> &List<ModuleRequest>;
+
+    fn get_loaded_modules(&self) -> &List<LoadedModuleRequest>;
+
+    fn get_dfs_ancestor_index(&self) -> Option<usize>;
+
+    fn get_cycle_root(&self) -> Option<ArcRw<dyn CyclicModuleRec>>;
+
+    fn get_evaluation_error(&self) -> Result<(), Box<dyn Object>>;
+
+    fn get_top_level_capability(&self) -> Option<PromiseCapability>;
+
+    fn get_async_evaluation_order(&self) -> AsyncEvalOrder;
+
+    fn get_pending_async_dependencies(&self) -> Option<usize>;
+
+    // this is technically a getter, not sure what to call the setter yet
+    fn has_tla(&self) -> bool;
+
+    fn set_status(&mut self, status: CyclicStatus);
+
+    fn set_dfs_ancestor_index(&mut self, index: Option<usize>);
+
+    fn set_top_level_capability(&mut self, capability: Option<PromiseCapability>);
+
+    fn set_pending_async_dependencies(&mut self, pending_deps: Option<usize>);
+
+    fn mut_async_parent_modules(&mut self) -> &mut List<dyn CyclicModuleRec>;
+
+    fn set_async_evaluation_order(&mut self, order: AsyncEvalOrder);
+
+    fn get_imported_module(&self, request: &ModuleRequest) -> ArcRw<dyn ModuleRec> {
+        let records = {
+            let mut ret = List::new();
+            
+            for r in self.get_loaded_modules().iter() {
+                if *r.read() == *request {
+                    ret.append_arc(r.clone());
+                }
+            }
+            ret
+        };
+
+        assert!(records.size() == 1);
+
+        // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+        todo!()
+    }
+
+    fn get_imported_module_mut(&mut self, request: &ModuleRequest) -> ArcRw<dyn ModuleRec> {
+        self.get_imported_module(request)
+    }
+
+    fn cmr_load_requested_modules(&mut self, host_defined: Option<Box<dyn Any>>) -> ArcRw<dyn Object> {
+        /*
+         * TODO: FIXME: using JType::Undefined here since constructors aren't
+         * implemented yet. should be the Promise constructor
+         */
+        let pc = PromiseCapability::new(JType::Undefined).unwrap();
+        let mut state = GraphLoadingState {
+            promise_capability: pc,
+            is_loading: true,
+            pending_modules_count: 1,
+            visited: List::new(),
+            host_defined,
+        };
+        
+        state.inner_module_loading(self.as_mut_abstract());
+        state.promise_capability.promise.clone()
+    }
+
+    fn cmr_link(&mut self) -> Result<(), Box<dyn Object>> {
+        assert!(match self.get_status() {
+            CyclicStatus::Unlinked | CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => true,
+            _ => false,
+        });
+
+        let mut stack = List::new();
+        let result = self.inner_module_linking(&mut stack, 0);
+
+        if result.is_err() {
+            for mut m in stack.iter_mut() {
+                if addr_eq(Arc::as_ptr(m), self.get_me().as_ptr()) {
+                    
+                }
+
+                assert!(m.read().get_status() == CyclicStatus::Linking);
+
+                m.write().set_status(CyclicStatus::Unlinked);
+            }
+            
+            assert!(self.get_status() == CyclicStatus::Unlinked);
+            return result.map(|_| ());
+        }
+        
+        assert!(match self.get_status() {
+            CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => true,
+            _ => false,
+        });
+        assert!(stack.size() == 0);
+
+        Ok(())
+    }
+
+    // TODO: returns a Promise object (NYI)
+    fn cmr_evaluate(&mut self) -> ArcRw<dyn Object> {
+        /*
+         * TODO: if Agents are ever implemented we need to take a lock within
+         * our agent to ensure that no evaluations happen simultaneously
+         */
+        // algorithm effectively has us override self. bleh. emulating
+        let mut module: &mut (dyn CyclicModuleRec + '_) = match self.get_status() {
+            CyclicStatus::Linked => CyclicModuleRec::as_mut_trait(self),
+            CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => {
+                if let Some(cycle_root) = self.get_cycle_root() {
+                    if !addr_eq(Arc::as_ptr(&cycle_root), self.get_me().as_ptr()) {
+                        &mut *cycle_root.write_arc()
+                    }
+                    else {
+                        CyclicModuleRec::as_mut_trait(self)
+                    }
+                }
+                else {
+                    assert!(self.get_status() == CyclicStatus::Evaluated && self.get_evaluation_error().is_err());
+                    CyclicModuleRec::as_mut_trait(self)
+                }
+            },
+            _ => panic!("cmr_evaluate: invalid module status"),
+        };
+
+        if let Some(top_level_capability) = module.get_top_level_capability() {
+            return top_level_capability.promise.clone();
+        }
+        
+        //let stack = List::new();
+        // TODO: FIXME: see comment in cmr_load_requested_modules
+        let capability = PromiseCapability::new(JType::Undefined).unwrap();
+
+        module.set_top_level_capability(Some(capability));
+        let result = todo!(); // InnerModuleEvaluation
+    }
+}
+
+// need to re-organize all Module Record code so organizing structs here
+
+pub struct ModuleBase {
+    /*
+     * modules shouldn't exist outside of a Realm, so this is a Weak to allow
+     * for module cleanup when the Realm is dropped
+     */
+    realm: Weak<RwLock<Realm>>,
+    environment: Option<ArcRw<ModuleEnv>>,
+    // yet-to-be-implemented ModuleNamespace object (ObjModuleNs)
+    namespace: Option<ArcRw<dyn Object>>,
+    host_defined: Option<Box<dyn Any>>,
+}
+
+pub struct CyclicModuleBase {
+    base: ModuleBase,
+    status: CyclicStatus,
+    evaluation_error: Result<(), Box<dyn Object>>,
+    dfs_ancestor_i: Option<usize>,
+    requested_modules: List<ModuleRequest>,
+    loaded_modules: List<LoadedModuleRequest>,
+    // need to reference the root but we should not be keeping it alive
+    cycle_root: Option<Weak<RwLock<dyn CyclicModuleRec>>>,
+    has_tla: bool,
+    async_eval_order: AsyncEvalOrder,
+    top_level_cap: Option<PromiseCapability>,
+    async_parent_mods: List<ArcRw<dyn CyclicModuleRec>>,
+    pending_async_deps: Option<usize>,
+}
+
+pub struct SourceTextModule {
+    base: CyclicModuleBase,
+    scr_code: ParseNode,
+    context: ScrExecContext,
+    import_meta: Option<ArcRw<dyn Object>>,
+    imports: List<ImportEntry>,
+    local_exports: List<ExportEntry>,
+    indirect_exports: List<ExportEntry>,
+    star_exports: List<ExportEntry>,
+}
+
+pub enum BindingName {
+    Null,
+    String(IString),
+    Namespace,
+    AllButDefault,
+}
+
+pub struct ExportEntry {
+    export_name: Option<IString>,
+    module_request: Option<ModuleRequest>,
+    import_name: BindingName,
+    local_name: Option<IString>,
+}
+
+pub struct ImportEntry {
+    module_request: ModuleRequest,
+    // only String and Namespace are valid here
+    import_name: BindingName,
+    local_name: IString,
+}
+
+pub enum TextType {
+    None,
+    Module(ArcRw<dyn ModuleRec>),
+    Script(Script),
+}
+
+pub struct Script {
+    realm: Weak<RwLock<Realm>>,
+    scr_code: ParseNode,
+    loaded_modules: List<LoadedModuleRequest>,
+    host_defined: Option<Box<dyn Any>>,
+}
+
+// note: spec says i can add anything i want to this
+
+pub struct ExecContextBase {
+    // should be a function object if Some
+    func: Option<Box<dyn Object>>,
+    realm: Weak<RwLock<Realm>>,
+    // ScriptOrModule
+    txt_rec: TextType,
+}
+
+pub struct ScrExecContext {
+    base: ExecContextBase,
+    lex_env: ArcRw<dyn EnvRecord>,
+    var_env: ArcRw<dyn EnvRecord>,
+    priv_env: PrivEnv,
+}
+
+pub struct PrivEnv {
+    outer_priv_env: Weak<RwLock<PrivEnv>>,
+    /*
+     * private names and Symbols are effectively the same, except
+     * that the description cannot be None. it is an error to add
+     * Symbols to this list with null descriptions
+     */
+    names: List<Symbol>,
+}
+
+pub struct ResolvedBinding {
+    module: ArcRw<dyn ModuleRec>,
+    // String or Namespace
+    binding_name: BindingName,
+}
+
+pub struct ModToName {
+    module: ArcRw<dyn ModuleRec>,
+    export_name: IString,
+}
+
+pub enum ExportResolution {
+    None,
+    Binding(ResolvedBinding),
+    Ambiguous,
+}
+
+pub trait ModuleRec {
+    fn is_cyclic_mut(&mut self) -> Option<&mut dyn CyclicModuleRec>;
+    
+    fn get_environment(&self) -> Option<ArcRw<ModuleEnv>>;
+
+    fn inner_module_linking(&mut self, stack: &mut List<dyn CyclicModuleRec>, mut index: usize) -> Result<usize, Box<dyn Object>> {
+        if let Some(module) = self.is_cyclic_mut() {
+            match module.get_status() {
+                CyclicStatus::Linking | CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => return Ok(index),
+                CyclicStatus::Unlinked => {
+                    module.set_status(CyclicStatus::Linking);
+                    
+                    let mut module_index = index;
+
+                    module.set_dfs_ancestor_index(Some(index));
+                    index += 1;
+                    stack.append_arc(module.get_me().upgrade().unwrap());
+                    for request in module.get_requested_modules().clone().iter() {
+                        /*
+                         * statement moved up here to prevent a double-borrow
+                         * conflict with the deadlock prevention below
+                         */
+                        let mod_dfs_index = module.get_dfs_ancestor_index().unwrap();
+                        let required_module: &mut (dyn ModuleRec + '_) = {
+                            let ret = module.get_imported_module_mut(&*request.read());
+
+                            if addr_eq(Arc::as_ptr(&ret), module.get_me().as_ptr()) {
+                                module
+                            }
+                            else {
+                                &mut *ret.write_arc()
+                            }
+                        };
+
+                        index = required_module.inner_module_linking(stack, index)?;
+                        if let Some(required_module) = required_module.is_cyclic_mut() {
+                            match required_module.get_status() {
+                                CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => (),
+                                CyclicStatus::Linking => {
+                                    assert!(stack.contains_weak(&required_module.get_me()).is_some());
+
+                                    let req_dfs_index = required_module.get_dfs_ancestor_index().unwrap();
+
+                                    module.set_dfs_ancestor_index(Some(mod_dfs_index.min(req_dfs_index)));
+                                },
+                                _ => panic!("inner_module_linking: BUG: invalid inner module status"),
+                            }
+                        }
+                    }
+                    module.initialize_environment()?;
+
+                    assert!({
+                        let mut once = 0;
+
+                        for item in stack.iter() {
+                            if once >= 2 {
+                                break
+                            }
+                            if Arc::as_ptr(item) == module.get_me().as_ptr() {
+                                once += 1;
+                            }
+                        }
+                        once == 1
+                    });
+                    assert!(module.get_dfs_ancestor_index().unwrap() <= module_index);
+
+                    if module.get_dfs_ancestor_index().unwrap() == module_index {
+                        let mut done = false;
+
+                        while !done {
+                            /*
+                             * could have used the infra stack struct but the
+                             * spec refers to a normal List here. fortunately,
+                             * we can deref into the Vec and pop() directly
+                             * also, the spec doesn't account for the list
+                             * being empty here, hence the unwrap() call.
+                             */
+                            let mut required_module = stack.pop().unwrap();
+
+                            // modified from spec to prevent deadlocks
+                            if addr_eq(Arc::as_ptr(&required_module), module.get_me().as_ptr()) {
+                                module.set_status(CyclicStatus::Linked);
+                                done = true;
+                            }
+                            else {
+                                required_module.write().set_status(CyclicStatus::Linked);
+                            }
+                        }
+                    }
+                    return Ok(index);
+                },
+                _ => panic!("inner_module_linking: BUG: invalid module status"),
+            }
+        }
+        self.link()?;
+        Ok(index)
+    }
+    
+    /*
+     * using dyn Any instead of JAny for host_defined since it is
+     * used by the implementor, not the spec
+     * also, returns a yet-to-be-implemented Promise object
+     */
+    fn load_requested_modules(&mut self, host_defined: Option<Box<dyn Any>>) -> Box<dyn Object>;
+
+    fn get_exported_names(&self, export_star_set: Option<List<SourceTextModule>>) -> List<IString>;
+
+    fn resolve_export(&self, export_name: &IString, resolve_set: Option<List<ModToName>>) -> ExportResolution;
+
+    fn link(&mut self) -> Result<(), Box<dyn Object>>;
+
+    // should be a Promise (NYI)
+    fn evaluate(&mut self) -> Box<dyn Object>;
+}
+
+pub struct LoadedModuleRequest {
+    specifier: IString,
+    // would love to make this a map but we can't implement partialeq on maps
+    attributes: List<ImportAttribute>,
+
+}
+
+impl PartialEq for LoadedModuleRequest {
+    fn eq(&self, other: &Self) -> bool {
+        if self.specifier != other.specifier && self.attributes.size() != other.attributes.size() {
+            return false
+        }
+        for l in self.attributes.iter() {
+            if other.attributes.contains(&*l.lock()).is_none() {
+                return false
+            }
+        }
+        true
+    }
+}
+
+impl PartialEq<ModuleRequest> for LoadedModuleRequest {
+    fn eq(&self, other: &ModuleRequest) -> bool {
+        
+        if self.specifier != other.specifier && self.attributes.size() != other.attributes.size() {
+            return false
+        }
+        for l in self.attributes.iter() {
+            if other.attributes.contains(&*l.lock()).is_none() {
+                return false
+            }
+        }
+        true
+    }
+}
+
+pub struct Realm {
+    // not messing with multithreading right now, can always be zero
+    agent: Number,
+    // seems to be where KNOWN_OBJECTS belongs, but not touching intrinsics yet
+    intrinsics: Map<String, ArcRw<dyn Object>>,
+    // FUCK. going to implement the bare minimum
+    global_object: ArcRw<dyn Object>,
+    // recursed back from the global object to here
+    global_env: GlobalEnv,
+    /*
+     * it can't ever make sense for ParseNodes to be Ord, since it doesn't make
+     * sense for Ord to be user-defined. otherwise this would be a Map struct
+     * TODO: implement parsing for TemplateLiteral
+     */
+    template_map: List<NodeToArr>,
+
+}
+
+trait BIFuncObjPriv {
+    
+}
+
+#[allow(private_bounds)]
+pub trait BIFuncObject: Object + BIFuncObjPriv {
+    
+}
+
+// ignoring the well-known intrinsics until i actually need to use them
+
+/*
+ * a note re: internal slots: it did not make sense to me to implement them as
+ * anything but hardcoded elements of a struct, but the specification does
+ * verify that they exist in some places, and tries to create them dynamically
+ * at object creation. i am thinking that i gather a list of all known internal
+ * object slots, then compose that into some kind of bitmap (boolmap?) and add
+ * one to every object to substitute. that said i am not implementing this yet.
+ */
+
+pub struct ObjGlobal {
+    // NEVER EVER LOCK self.me FROM INSIDE A MUTABLE METHOD
+    me: Weak<RwLock<ObjGlobal>>,
+    id: u64,
+    overridden_methods: [bool; 11],
+    #[allow(dead_code)] // to be used later
+    private_elements: List<PrivElem>,
+    is_ordinary: bool,
+    prototype: Option<ArcRw<dyn Object>>,
+    extensible: bool,
+    map: Map<Key, PropDesc>,
+}
+
+impl ObjectPriv for ObjGlobal {
+    fn get_private_elements(&self) -> &List<PrivElem> {
+        &self.private_elements
+    }
+
+    fn mut_private_elements(&mut self) -> &mut List<PrivElem> {
+        &mut self.private_elements
+    }
+
+    fn is_ordinary(&self) -> bool {
+        self.is_ordinary
+    }
+    
+    fn get_proto(&self) -> Option<ArcRw<dyn Object>> {
+        match &self.prototype {
+            Some(am) => Some(am.clone()),
+            None => None,
+        }
+    }
+
+    fn set_proto(&mut self, proto: Option<ArcRw<dyn Object>>) {
+        self.prototype = proto;
+    }
+
+    fn get_id(&self) -> u64 {
+        self.id
+    }
+
+    fn get_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn set_extensible(&mut self, val: bool) {
+        self.extensible = val;
+    }
+
+    fn get_overridden_methods(&self) -> [bool; 11] {
+        self.overridden_methods
+    }
+
+    // we don't have call or construct
+    fn call_overridden(&self) -> bool {
+        false
+    }
+
+    fn construct_overridden(&self) -> bool {
+        false
+    }
+
+    fn get_me(&self) -> Weak<RwLock<dyn Object>> {
+        self.me.clone()
+    }
+
+    fn get_map(&self) -> &Map<Key, PropDesc> {
+        &self.map
+    }
+
+    fn mut_map(&mut self) -> &mut Map<Key, PropDesc> {
+        &mut self.map
+    }
+    
+    fn get_call(&self) -> Option<Callfunc> {
+        None
+    }
+
+    fn get_constructor(&self) -> Option<Consfunc> {
+        None
+    }
+
+    fn as_trait(&self) -> &dyn Object {
+        self as &dyn Object
+    }
+
+    fn as_mut_trait(&mut self) -> &mut dyn Object {
+        self as &mut dyn Object
+    }
+
+    fn get_name(&self) -> String {
+        String::from("global object")
+    }
+}
+
+impl Object for ObjGlobal {
+
+}
+
+impl ObjGlobal {
+    #[must_use]
+    pub fn new(r: Realm) -> ArcRw<Self> {
+        Arc::new_cyclic(|me| {
+            let mut def = Self {
+                me: me.clone(),
+                id: Self::next_id(),
+                overridden_methods: [false; 11],
+                private_elements: List::new(),
+                is_ordinary: true,
+                prototype: None,
+                extensible: true,
+                map: Map::new(),
+            };
+            // value is from an as-yet undefined realm record
+            def.map.set(Key::String(IString::from_str("globalThis")), PropDesc {
+                value: todo!(),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            });
+            RwLock::new(def)
+        })
+    }
+}
+
+/*
+ * a note about constructors: their definition within the spec makes frequent
+ * reference to "NewTarget." i beleive this is something that would be
+ * constructed during actual Javascript parsing. going to ignore it for now
+ * since many constructors (and hopefully the ones i actually need to touch)
+ * can also be called directly as functions
+ */
+
+pub struct ObjErrorCons {
+    // NEVER EVER LOCK self.me FROM INSIDE A MUTABLE METHOD
+    me: Weak<RwLock<ObjErrorCons>>,
+    id: u64,
+    overridden_methods: [bool; 11],
+    #[allow(dead_code)] // to be used later
+    private_elements: List<PrivElem>,
+    is_ordinary: bool,
+    prototype: Option<ArcRw<dyn Object>>,
+    extensible: bool,
+    map: Map<Key, PropDesc>,
+}
+
+impl ObjectPriv for ObjErrorCons {
+    fn get_private_elements(&self) -> &List<PrivElem> {
+        &self.private_elements
+    }
+
+    fn mut_private_elements(&mut self) -> &mut List<PrivElem> {
+        &mut self.private_elements
+    }
+
+    fn is_ordinary(&self) -> bool {
+        self.is_ordinary
+    }
+    
+    fn get_proto(&self) -> Option<ArcRw<dyn Object>> {
+        match &self.prototype {
+            Some(am) => Some(am.clone()),
+            None => None,
+        }
+    }
+
+    fn set_proto(&mut self, proto: Option<ArcRw<dyn Object>>) {
+        self.prototype = proto;
+    }
+
+    fn get_id(&self) -> u64 {
+        self.id
+    }
+
+    fn get_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn set_extensible(&mut self, val: bool) {
+        self.extensible = val;
+    }
+
+    fn get_overridden_methods(&self) -> [bool; 11] {
+        self.overridden_methods
+    }
+
+    fn call_overridden(&self) -> bool {
+        false
+    }
+
+    fn construct_overridden(&self) -> bool {
+        false
+    }
+
+    fn get_me(&self) -> Weak<RwLock<dyn Object>> {
+        self.me.clone()
+    }
+
+    fn get_map(&self) -> &Map<Key, PropDesc> {
+        &self.map
+    }
+
+    fn mut_map(&mut self) -> &mut Map<Key, PropDesc> {
+        &mut self.map
+    }
+    
+    fn get_call(&self) -> Option<Callfunc> {
+        None
+    }
+
+    fn get_constructor(&self) -> Option<Consfunc> {
+        None
+    }
+    
+    fn as_trait(&self) -> &dyn Object {
+        self as &dyn Object
+    }
+
+    fn as_mut_trait(&mut self) -> &mut dyn Object {
+        self as &mut dyn Object
+    }
+
+    fn get_name(&self) -> String {
+        String::from("error constructor")
+    }
+}
+
+impl Object for ObjErrorCons {
+
+}
+
+impl ObjErrorCons {
+    #[must_use]
+    pub fn new(proto: Option<ArcRw<dyn Object>>) -> ArcRw<Self> {
+        Arc::new_cyclic(|me| RwLock::new(Self {
+            me: me.clone(),
+            id: Self::next_id(),
+            overridden_methods: [false; 11],
+            private_elements: List::new(),
+            is_ordinary: true,
+            prototype: proto,
+            extensible: true,
+            map: Map::new(),
+        }))
+    }
+}
+
+pub struct ObjErrorProto {
+    // NEVER EVER LOCK self.me FROM INSIDE A MUTABLE METHOD
+    me: Weak<RwLock<ObjErrorProto>>,
+    id: u64,
+    overridden_methods: [bool; 11],
+    #[allow(dead_code)] // to be used later
+    private_elements: List<PrivElem>,
+    is_ordinary: bool,
+    prototype: Option<ArcRw<dyn Object>>,
+    extensible: bool,
+    map: Map<Key, PropDesc>,
+}
+
+impl ObjectPriv for ObjErrorProto {
+    fn get_private_elements(&self) -> &List<PrivElem> {
+        &self.private_elements
+    }
+
+    fn mut_private_elements(&mut self) -> &mut List<PrivElem> {
+        &mut self.private_elements
+    }
+
+    fn is_ordinary(&self) -> bool {
+        self.is_ordinary
+    }
+    
+    fn get_proto(&self) -> Option<ArcRw<dyn Object>> {
+        match &self.prototype {
+            Some(am) => Some(am.clone()),
+            None => None,
+        }
+    }
+
+    fn set_proto(&mut self, proto: Option<ArcRw<dyn Object>>) {
+        self.prototype = proto;
+    }
+
+    fn get_id(&self) -> u64 {
+        self.id
+    }
+
+    fn get_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn set_extensible(&mut self, val: bool) {
+        self.extensible = val;
+    }
+
+    fn get_overridden_methods(&self) -> [bool; 11] {
+        self.overridden_methods
+    }
+
+    // we don't have call or construct
+    fn call_overridden(&self) -> bool {
+        false
+    }
+
+    fn construct_overridden(&self) -> bool {
+        false
+    }
+
+    fn get_me(&self) -> Weak<RwLock<dyn Object>> {
+        self.me.clone()
+    }
+
+    fn get_map(&self) -> &Map<Key, PropDesc> {
+        &self.map
+    }
+
+    fn mut_map(&mut self) -> &mut Map<Key, PropDesc> {
+        &mut self.map
+    }
+    
+    fn get_call(&self) -> Option<Callfunc> {
+        None
+    }
+
+    fn get_constructor(&self) -> Option<Consfunc> {
+        None
+    }
+
+    fn as_trait(&self) -> &dyn Object {
+        self as &dyn Object
+    }
+
+    fn as_mut_trait(&mut self) -> &mut dyn Object {
+        self as &mut dyn Object
+    }
+
+    fn get_name(&self) -> String {
+        String::from("error prototype")
+    }
+}
+
+impl Object for ObjErrorProto {
+
+}
+
+impl ObjErrorProto {
+    #[must_use]
+    pub fn new(proto: Option<ArcRw<dyn Object>>) -> ArcRw<Self> {
+        Arc::new_cyclic(|me| RwLock::new(Self {
+            me: me.clone(),
+            id: Self::next_id(),
+            overridden_methods: [false; 11],
+            private_elements: List::new(),
+            is_ordinary: true,
+            prototype: proto,
+            extensible: true,
+            map: Map::new(),
+        }))
+    }
+}
+
+pub struct ObjError {
+    // NEVER EVER LOCK self.me FROM INSIDE A MUTABLE METHOD
+    me: Weak<RwLock<ObjError>>,
+    id: u64,
+    overridden_methods: [bool; 11],
+    #[allow(dead_code)] // to be used later
+    private_elements: List<PrivElem>,
+    is_ordinary: bool,
+    prototype: Option<ArcRw<dyn Object>>,
+    extensible: bool,
+    map: Map<Key, PropDesc>,
+}
+
+impl ObjectPriv for ObjError {
+    fn get_private_elements(&self) -> &List<PrivElem> {
+        &self.private_elements
+    }
+
+    fn mut_private_elements(&mut self) -> &mut List<PrivElem> {
+        &mut self.private_elements
+    }
+
+    fn is_ordinary(&self) -> bool {
+        self.is_ordinary
+    }
+    
+    fn get_proto(&self) -> Option<ArcRw<dyn Object>> {
+        match &self.prototype {
+            Some(am) => Some(am.clone()),
+            None => None,
+        }
+    }
+
+    fn set_proto(&mut self, proto: Option<ArcRw<dyn Object>>) {
+        self.prototype = proto;
+    }
+
+    fn get_id(&self) -> u64 {
+        self.id
+    }
+
+    fn get_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn set_extensible(&mut self, val: bool) {
+        self.extensible = val;
+    }
+
+    fn get_overridden_methods(&self) -> [bool; 11] {
+        self.overridden_methods
+    }
+
+    // we don't have call or construct
+    fn call_overridden(&self) -> bool {
+        false
+    }
+
+    fn construct_overridden(&self) -> bool {
+        false
+    }
+
+    fn get_me(&self) -> Weak<RwLock<dyn Object>> {
+        self.me.clone()
+    }
+
+    fn get_map(&self) -> &Map<Key, PropDesc> {
+        &self.map
+    }
+
+    fn mut_map(&mut self) -> &mut Map<Key, PropDesc> {
+        &mut self.map
+    }
+    
+    fn get_call(&self) -> Option<Callfunc> {
+        None
+    }
+
+    fn get_constructor(&self) -> Option<Consfunc> {
+        None
+    }
+
+    fn as_trait(&self) -> &dyn Object {
+        self as &dyn Object
+    }
+
+    fn as_mut_trait(&mut self) -> &mut dyn Object {
+        self as &mut dyn Object
+    }
+
+    fn get_name(&self) -> String {
+        String::from("error object")
+    }
+}
+
+impl Object for ObjError {
+
+}
+
+impl ObjError {
+    #[must_use]
+    pub fn new(proto: Option<ArcRw<dyn Object>>) -> ArcRw<Self> {
+        Arc::new_cyclic(|me| RwLock::new(Self {
+            me: me.clone(),
+            id: Self::next_id(),
+            overridden_methods: [false; 11],
+            private_elements: List::new(),
+            is_ordinary: true,
+            prototype: proto,
+            extensible: true,
+            map: Map::new(),
+        }))
+    }
+}
+
+// the convention for structs that implement Object is Obj'object type'
+pub struct ObjObject {
+    // NEVER EVER LOCK self.me FROM INSIDE A MUTABLE METHOD
+    me: Weak<RwLock<ObjObject>>,
+    id: u64,
+    overridden_methods: [bool; 11],
+    #[allow(dead_code)] // to be used later
+    private_elements: List<PrivElem>,
+    is_ordinary: bool,
+    prototype: Option<ArcRw<dyn Object>>,
+    extensible: bool,
+    map: Map<Key, PropDesc>,
+}
+
+impl ObjectPriv for ObjObject {
+    fn get_private_elements(&self) -> &List<PrivElem> {
+        &self.private_elements
+    }
+
+    fn mut_private_elements(&mut self) -> &mut List<PrivElem> {
+        &mut self.private_elements
+    }
+
+    fn is_ordinary(&self) -> bool {
+        self.is_ordinary
+    }
+    
+    fn get_proto(&self) -> Option<ArcRw<dyn Object>> {
+        match &self.prototype {
+            Some(am) => Some(am.clone()),
+            None => None,
+        }
+    }
+
+    fn set_proto(&mut self, proto: Option<ArcRw<dyn Object>>) {
+        self.prototype = proto;
+    }
+
+    fn get_id(&self) -> u64 {
+        self.id
+    }
+
+    fn get_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn set_extensible(&mut self, val: bool) {
+        self.extensible = val;
+    }
+
+    fn get_overridden_methods(&self) -> [bool; 11] {
+        self.overridden_methods
+    }
+
+    // we don't have call or construct
+    fn call_overridden(&self) -> bool {
+        false
+    }
+
+    fn construct_overridden(&self) -> bool {
+        false
+    }
+
+    fn get_me(&self) -> Weak<RwLock<dyn Object>> {
+        self.me.clone()
+    }
+
+    fn get_map(&self) -> &Map<Key, PropDesc> {
+        &self.map
+    }
+
+    fn mut_map(&mut self) -> &mut Map<Key, PropDesc> {
+        &mut self.map
+    }
+    
+    fn get_call(&self) -> Option<Callfunc> {
+        None
+    }
+
+    fn get_constructor(&self) -> Option<Consfunc> {
+        None
+    }
+
+    fn as_trait(&self) -> &dyn Object {
+        self as &dyn Object
+    }
+
+    fn as_mut_trait(&mut self) -> &mut dyn Object {
+        self as &mut dyn Object
+    }
+
+    fn get_name(&self) -> String {
+        String::from("object object")
+    }
+}
+
+impl Object for ObjObject {
+
+}
+
+impl ObjObject {
+    #[must_use]
+    pub fn new(proto: Option<ArcRw<dyn Object>>) -> ArcRw<Self> {
+        Arc::new_cyclic(|me| RwLock::new(Self {
+            me: me.clone(),
+            id: Self::next_id(),
+            overridden_methods: [false; 11],
+            private_elements: List::new(),
+            is_ordinary: true,
+            prototype: proto,
+            extensible: true,
+            map: Map::new(),
+        }))
+    }
+}
+
+pub mod util {
+    use super::PropDesc;
+
+    /*
+     * validation was split off from the validate_and_apply funcs for
+     * complexity reasons (thank you clippy.) that said, not
+     * splitting it is technically more conformant to the standard,
+     * but since i had to split it anyway to avoid wrapping self in
+     * an Option i may as well factor out the common code
+     */
+    #[must_use]
+    #[allow(clippy::missing_panics_doc)] // if we panic this is a bug
+    pub fn validate_propdesc(desc: &PropDesc, current: &PropDesc) -> Option<bool> {
+        assert!(current.is_fully_populated());
+        if desc.no_fields() {
+            return Some(true);
+        }
+        if let Some(curr_configurable) = current.configurable && !curr_configurable {
+            if let Some(desc_configurable) = desc.configurable && desc_configurable {
+                return Some(false);
+            }
+            if let Some(desc_enumerable) = desc.enumerable && desc_enumerable != current.enumerable.unwrap() {
+                return Some(false);
+            }
+            if !desc.is_generic_descriptor() && desc.is_accessor_descriptor() != current.is_accessor_descriptor() {
+                return Some(false);
+            }
+            if current.is_accessor_descriptor() {
+                if let Some(desc_get) = &desc.get && !desc_get.same_value(&current.get.clone().unwrap()) {
+                    return Some(false);
+                }
+                if let Some(desc_set) = &desc.set && !desc_set.same_value(&current.set.clone().unwrap()) {
+                    return Some(false);
+                }
+
+            }
+            else if !current.writable.unwrap() {
+                if let Some(desc_writable) = desc.writable && desc_writable {
+                    return Some(false);
+                }
+                /*
+                 * from ECMA-262, with variable names replaced:
+                 * NOTE: JType::same_value returns true for NaN values
+                 * which may be distinguishable by other means.
+                 * Returning here ensures that any existing property of
+                 * o remains unmodified.
+                 */
+                if let Some(desc_value) = &desc.value {
+                    return Some(desc_value.same_value(&current.value.clone().unwrap()))
+                }
+            }
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn is_compatible_propdesc(extensible: bool, desc: &PropDesc, current: &Option<PropDesc>) -> bool {
+        match current {
+            Some(current) => validate_propdesc(desc, current).unwrap_or(true),
+            None => extensible
+        }
+    }
+}

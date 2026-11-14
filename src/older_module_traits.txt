@@ -1,0 +1,379 @@
+pub trait CyclicModuleRec: ModuleRec {
+    // keyword collision. bleh. otherwise would just be abstract()
+    fn as_abstract(&self) -> &dyn ModuleRec;
+
+    fn as_mut_abstract(&mut self) -> &mut dyn ModuleRec;
+
+    fn as_trait(&self) -> &dyn CyclicModuleRec;
+
+    fn as_mut_trait(&mut self) -> &mut dyn CyclicModuleRec;
+
+    fn get_me(&self) -> Weak<RwLock<dyn CyclicModuleRec>>;
+
+    fn get_status(&self) -> CyclicStatus;
+
+    fn get_requested_modules(&self) -> &List<ModuleRequest>;
+
+    fn get_loaded_modules(&self) -> &List<LoadedModuleRequest>;
+
+    fn get_dfs_ancestor_index(&self) -> Option<usize>;
+
+    fn get_cycle_root(&self) -> Option<ArcRw<dyn CyclicModuleRec>>;
+
+    fn get_evaluation_error(&self) -> Result<(), Box<dyn Object>>;
+
+    fn get_top_level_capability(&self) -> Option<PromiseCapability>;
+
+    fn get_async_evaluation_order(&self) -> AsyncEvalOrder;
+
+    fn get_pending_async_dependencies(&self) -> Option<usize>;
+
+    // this is technically a getter, not sure what to call the setter yet
+    fn has_tla(&self) -> bool;
+
+    fn set_status(&mut self, status: CyclicStatus);
+
+    fn set_dfs_ancestor_index(&mut self, index: Option<usize>);
+
+    fn set_top_level_capability(&mut self, capability: Option<PromiseCapability>);
+
+    fn set_pending_async_dependencies(&mut self, pending_deps: Option<usize>);
+
+    fn mut_async_parent_modules(&mut self) -> &mut List<dyn CyclicModuleRec>;
+
+    fn set_async_evaluation_order(&mut self, order: AsyncEvalOrder);
+
+    fn initialize_environment(&mut self) -> Result<(), Box<dyn Object>>;
+
+    fn execute_module(&self, capability: Option<PromiseCapability>) -> Result<(), Box<dyn Object>>;
+
+    fn get_imported_module(&self, request: &ModuleRequest) -> ArcRw<dyn ModuleRec> {
+        let records = {
+            let mut ret = List::new();
+            
+            for r in self.get_loaded_modules().iter() {
+                if *r.read() == *request {
+                    ret.append_arc(r.clone());
+                }
+            }
+            ret
+        };
+
+        assert!(records.size() == 1);
+
+        // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+        todo!()
+    }
+
+    fn get_imported_module_mut(&mut self, request: &ModuleRequest) -> ArcRw<dyn ModuleRec> {
+        self.get_imported_module(request)
+    }
+
+    fn cmr_load_requested_modules(&mut self, host_defined: Option<Box<dyn Any>>) -> ArcRw<dyn Object>
+    where
+        Self: Sized,
+    {
+        /*
+         * TODO: FIXME: using JType::Undefined here since constructors aren't
+         * implemented yet. should be the Promise constructor
+         */
+        let pc = PromiseCapability::new(JType::Undefined).unwrap();
+        let mut state = GraphLoadingState {
+            promise_capability: pc,
+            is_loading: true,
+            pending_modules_count: 1,
+            visited: List::new(),
+            host_defined,
+        };
+        
+        state.inner_module_loading(self);
+        state.promise_capability.promise.clone()
+    }
+
+    fn cmr_link(&mut self) -> Result<(), Box<dyn Object>> {
+        assert!(match self.get_status() {
+            CyclicStatus::Unlinked | CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => true,
+            _ => false,
+        });
+
+        let mut stack = List::new();
+        let result = self.inner_module_linking(&mut stack, 0);
+
+        if result.is_err() {
+            for m in stack.iter_mut() {
+                assert!(m.read().get_status() == CyclicStatus::Linking);
+
+                m.write().set_status(CyclicStatus::Unlinked);
+            }
+            
+            assert!(self.get_status() == CyclicStatus::Unlinked);
+            return result.map(|_| ());
+        }
+        
+        assert!(match self.get_status() {
+            CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => true,
+            _ => false,
+        });
+        assert!(stack.size() == 0);
+
+        Ok(())
+    }
+
+    // TODO: returns a Promise object (NYI)
+    fn cmr_evaluate(&mut self) -> ArcRw<dyn Object> {
+        /*
+         * TODO: if Agents are ever implemented we need to take a lock within
+         * our agent to ensure that no evaluations happen simultaneously
+         */
+        // algorithm effectively has us override self. bleh. emulating
+        let mut module: &mut (dyn CyclicModuleRec + '_) = match self.get_status() {
+            CyclicStatus::Linked => CyclicModuleRec::as_mut_trait(self),
+            CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => {
+                if let Some(cycle_root) = self.get_cycle_root() {
+                    if !addr_eq(Arc::as_ptr(&cycle_root), self.get_me().as_ptr()) {
+                        &mut *cycle_root.write_arc()
+                    }
+                    else {
+                        CyclicModuleRec::as_mut_trait(self)
+                    }
+                }
+                else {
+                    assert!(self.get_status() == CyclicStatus::Evaluated && self.get_evaluation_error().is_err());
+                    CyclicModuleRec::as_mut_trait(self)
+                }
+            },
+            _ => panic!("cmr_evaluate: invalid module status"),
+        };
+
+        if let Some(top_level_capability) = module.get_top_level_capability() {
+            return top_level_capability.promise.clone();
+        }
+        
+        //let stack = List::new();
+        // TODO: FIXME: see comment in cmr_load_requested_modules
+        let capability = PromiseCapability::new(JType::Undefined).unwrap();
+
+        module.set_top_level_capability(Some(capability));
+        let result = todo!(); // InnerModuleEvaluation
+    }
+}
+
+pub trait ModuleRec {
+    fn as_trait(&self) -> &dyn ModuleRec;
+
+    fn as_mut_trait(&mut self) -> &mut dyn ModuleRec;
+    /*
+     * will this even work? also, note that we are expected to be
+     * locked already when these are called
+     */
+    fn is_cyclic(&self) -> Option<&dyn CyclicModuleRec>;
+
+    fn is_cyclic_mut(&mut self) -> Option<&mut dyn CyclicModuleRec>;
+
+    fn get_environment(&self) -> Option<ArcRw<ModuleEnv>>;
+
+    fn inner_module_linking(&mut self, stack: &mut List<dyn CyclicModuleRec>, mut index: usize) -> Result<usize, Box<dyn Object>> {
+        if let Some(module) = self.is_cyclic_mut() {
+            match module.get_status() {
+                CyclicStatus::Linking | CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => return Ok(index),
+                CyclicStatus::Unlinked => {
+                    module.set_status(CyclicStatus::Linking);
+                    
+                    let mut module_index = index;
+
+                    module.set_dfs_ancestor_index(Some(index));
+                    index += 1;
+                    stack.append_arc(module.get_me().upgrade().unwrap());
+                    for request in module.get_requested_modules().clone().iter() {
+                        /*
+                         * statement moved up here to prevent a double-borrow
+                         * conflict with the deadlock prevention below
+                         */
+                        let mod_dfs_index = module.get_dfs_ancestor_index().unwrap();
+                        let required_module: &mut (dyn ModuleRec + '_) = {
+                            let ret = module.get_imported_module_mut(&*request.read());
+
+                            if addr_eq(Arc::as_ptr(&ret), module.get_me().as_ptr()) {
+                                module
+                            }
+                            else {
+                                &mut *ret.write_arc()
+                            }
+                        };
+
+                        index = required_module.inner_module_linking(stack, index)?;
+                        if let Some(required_module) = required_module.is_cyclic_mut() {
+                            match required_module.get_status() {
+                                CyclicStatus::Linked | CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => (),
+                                CyclicStatus::Linking => {
+                                    assert!(stack.contains_weak(&required_module.get_me()).is_some());
+
+                                    let req_dfs_index = required_module.get_dfs_ancestor_index().unwrap();
+
+                                    module.set_dfs_ancestor_index(Some(mod_dfs_index.min(req_dfs_index)));
+                                },
+                                _ => panic!("inner_module_linking: BUG: invalid inner module status"),
+                            }
+                        }
+                    }
+                    module.initialize_environment()?;
+
+                    assert!({
+                        let mut once = 0;
+
+                        for item in stack.iter() {
+                            if once >= 2 {
+                                break
+                            }
+                            if Arc::as_ptr(item) == module.get_me().as_ptr() {
+                                once += 1;
+                            }
+                        }
+                        once == 1
+                    });
+                    assert!(module.get_dfs_ancestor_index().unwrap() <= module_index);
+
+                    if module.get_dfs_ancestor_index().unwrap() == module_index {
+                        let mut done = false;
+
+                        while !done {
+                            /*
+                             * could have used the infra stack struct but the
+                             * spec refers to a normal List here. fortunately,
+                             * we can deref into the Vec and pop() directly
+                             * also, the spec doesn't account for the list
+                             * being empty here, hence the unwrap() call.
+                             */
+                            let mut required_module = stack.pop().unwrap();
+
+                            // modified from spec to prevent deadlocks
+                            if addr_eq(Arc::as_ptr(&required_module), module.get_me().as_ptr()) {
+                                module.set_status(CyclicStatus::Linked);
+                                done = true;
+                            }
+                            else {
+                                required_module.write().set_status(CyclicStatus::Linked);
+                            }
+                        }
+                    }
+                    return Ok(index);
+                },
+                _ => panic!("inner_module_linking: BUG: invalid module status"),
+            }
+        }
+        self.link()?;
+        Ok(index)
+    }
+
+    fn evaluate_module_sync(&mut self) -> Result<(), Box<dyn Object>> {
+        assert!(self.is_cyclic_mut().is_none());
+
+        let promise = self.evaluate();
+
+        // gets into details of Promise objects here
+        // PENDING FULL IMPLEMENTATION - Caused implementation cycle!
+        todo!()
+    }
+
+    fn inner_module_evaluation(&mut self, stack: &mut List<dyn CyclicModuleRec>, mut index: usize) -> Result<usize, Box<dyn Object>> {
+        if let Some(module) = self.is_cyclic_mut() {
+            match module.get_status() {
+                CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => {
+                    module.get_evaluation_error().map(|_| index)
+                },
+                CyclicStatus::Evaluating => Ok(index),
+                CyclicStatus::Linked => {
+                    module.set_status(CyclicStatus::Evaluating);
+
+                    let module_index = index;
+
+                    module.set_dfs_ancestor_index(Some(index));
+                    module.set_pending_async_dependencies(Some(0));
+                    index += 1;
+                    stack.append_arc(module.get_me().upgrade().unwrap());
+                    for request in module.get_requested_modules().clone().iter() {
+                        /*
+                         * statement moved up here to prevent a double-borrow
+                         * conflict with the deadlock prevention below
+                         */
+                        let mod_dfs_index = module.get_dfs_ancestor_index().clone().unwrap();
+                        let mut required_module = {
+                            let imp = module.get_imported_module_mut(&*request.read());
+
+                            if addr_eq(Arc::as_ptr(&imp), module.get_me().as_ptr()) {
+                                /*
+                                 * note: effectively returns self,
+                                 * but can't use self since it's
+                                 * borrowed as module, then imp
+                                 */
+                                module.as_mut_abstract()
+                            }
+                            else {
+                                &mut *imp.write_arc()
+                            }
+                        };
+
+                        index = required_module.inner_module_evaluation(stack, index)?;
+                        if let Some(mut required_module) = required_module.is_cyclic() {
+                            match required_module.get_status() {
+                                CyclicStatus::Evaluating => {
+                                    assert!(stack.contains_weak(&required_module.get_me()).is_some());
+
+                                    let req_dfs_index = required_module.get_dfs_ancestor_index().unwrap();
+                                    
+                                    module.set_dfs_ancestor_index(Some(mod_dfs_index.min(req_dfs_index)));
+                                },
+                                CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => {
+                                    required_module = &*required_module.get_cycle_root().unwrap().read_recursive();
+                                    match required_module.get_status() {
+                                        CyclicStatus::EvaluatingAsync | CyclicStatus::Evaluated => {
+                                            if let Err(e) = required_module.get_evaluation_error() {
+                                                return Err(e);
+                                            }
+                                        },
+                                        _ => panic!("inner_module_evaluation: BUG: invalid inner root module status"),
+                                    }
+                                },
+                                _ => panic!("inner_module_evaluation: BUG: invalid inner module status"),
+                            }
+                            if let AsyncEvalOrder::Position(pos) = required_module.get_async_evaluation_order() {
+                                module.set_pending_async_dependencies(Some(module.get_pending_async_dependencies().unwrap()+1));
+                                required_module.mut_async_parent_modules().append_arc(module.get_me().upgrade().unwrap());
+                            }
+                        }
+                    }
+                    if module.get_pending_async_dependencies().unwrap() > 0 || module.has_tla() {
+                        assert!(module.get_async_evaluation_order() == AsyncEvalOrder::Unset);
+
+                        /*
+                         * dammit, now i need to deal with agents. will start
+                         * with a single global static record since right now
+                         * everything will be single-threaded
+                         */
+                        module.set_async_evaluation_order(todo!()); // IncrementModuleAsyncEvaluationCount
+                    }
+                    todo!()
+                },
+                _ => panic!("inner_module_evaluation: BUG: invalid module status"),
+            }
+        }
+        else {
+            self.evaluate_module_sync()?;
+            Ok(index)
+        }
+    }
+
+    /*
+     * using dyn Any instead of JAny for host_defined since it is
+     * used by the implementor, not the spec
+     * also, returns a yet-to-be-implemented Promise object
+     */
+    fn load_requested_modules(&mut self, host_defined: Option<Box<dyn Any>>) -> Box<dyn Object>;
+
+    fn get_exported_names(&self /*, List<SourceTextModule> */);
+
+    fn link(&mut self) -> Result<(), Box<dyn Object>>;
+
+    // should be a Promise (NYI)
+    fn evaluate(&mut self) -> Box<dyn Object>;
+}

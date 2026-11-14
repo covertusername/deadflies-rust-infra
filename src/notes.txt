@@ -1,0 +1,218 @@
+I'm starting to think rolling my own wide strings using Vec<IChar> as the core
+would be a better implementation overall, but I'm not quite there yet. A lot of
+my logic already uses them internally, and only uses the underlying strings for
+u16 storage and string utility functions I haven't implemented myself (or have
+implemented with a thin wrapper.) Only time will tell if this makes sense,
+though - the widestring crate has been pretty useful and problem-free so far.
+See IString::retain() in libs.rs for a function that may be improved by a Vec
+implementation of wide strings.
+
+Rat's nest tracking: 
+infra.6: JSON
+	parse a JSON string to a JavaScript value:
+	    ? (ignoring for now)
+        ECMA-262.7.3.13: Call(F, V, [argumentsList ] )
+            fn js_call(f: IType, v: IType, mut arguments_list: Option<List>)
+                if arguments_list.is_none() {
+                    arguments_list = List::new(); // may need to make this Option<List>
+                    /*
+                     * 7.2.3 IsCallable(argument)
+                     *  6.1.7 The Object Type
+                            use std::sync::Mutex;
+
+                            pub struct Object(pub Map<Key, Property>);
+
+                            // note: Objects have default Symbols but aren't implemented yet
+
+                            // Symbol tweaked from https://users.rust-lang.org/t/does-rust-have-something-like-symbol-in-javascript/128209/5
+                            
+                            pub struct Symbol {
+                                id: u64,
+                                description: Option<IString>,
+                            }
+
+                            impl Symbol {
+                                static KNOWN_SYMBOLS = Mutex::new(Map::new());
+
+                                #[must_use]
+                                pub fn new(desc: &Option<IString>) -> Symbol {
+                                    static SYMBOL_COUNTER = AtomicU64::new(0);
+
+                                    Symbol {
+                                        id: SYMBOL_COUNTER.fetch_add(1, Ordering::Relaxed),
+                                        description: desc.clone();
+                                    }
+                                }
+
+                                // known symbols map to known object property values, but none of these are implemented yet. can still create the symbols themselves for now
+                                fn init_known_symbols() {
+                                    let mut syms = KNOWN_SYMBOLS.lock().unwrap();
+                                    let names = [
+                                        "Symbol.asyncIterator",
+                                        "Symbol.hasInstance",
+                                        "Symbol.isConcatSpreadable",
+                                        "Symbol.iterator",
+                                        "Symbol.match",
+                                        "Symbol.matchAll",
+                                        "Symbol.replace",
+                                        "Symbol.search",
+                                        "Symbol.species",
+                                        "Symbol.split",
+                                        "Symbol.toPrimitive",
+                                        "Symbol.toStringTag",
+                                        "Symbol.unscopables"
+                                    ];
+
+                                    for s in names {
+                                        syms.set(s, Symbol::new(Some(IString::from_str(s))));
+                                    }
+                                }
+                            }
+
+                            enum Key {
+                                String(IString),
+                                Symbol(Symbol),
+                            }
+
+                            impl Key {
+                                #[must_use]
+                                pub fn is_name(&self) -> bool {
+                                    match self {
+                                        String(_) -> true,
+                                        Symbol(_) -> false,
+                                    }
+                                }
+
+                                pub fn is_index(&self) -> bool {
+                                    match self {
+                                        String(_) -> {
+                                            /*
+                                             * 7.1.21 CanonicalNumericIndexString(argument)
+                                                // under impl IString in lib.rs
+                                                pub fn canonical_numeric_index_string(&self) -> Option<Number> {
+                                                    /*
+                                                     * 6.1.6.1 The Number Type
+                                                        use std::ops::Neg;
+
+                                                        struct Number(pub f64);
+
+                                                        #[derive(Copy, PartialEq)]
+                                                        impl Number {
+                                                            pub fn is_negative(self) -> bool {
+                                                                self.0.is_sign_negative()
+                                                            }
+
+                                                            pub fn exponent(self) -> i64 {
+                                                                (self.0.to_bits() >> 52 & 0x7FF) as i64 - 1023
+                                                            }
+
+                                                            pub fn mantissa(self) -> i64 {
+                                                                (self.0.to_bits() & 0xFFFFFFFFFFFFF) as i64
+                                                            }
+
+                                                            pub fn is_finite(self) -> bool {
+                                                                self.0.is_finite()
+                                                            }
+
+                                                            pub fn is_normal(self) -> bool {
+                                                                self.0.is_normal()
+                                                            }
+
+                                                            // not sure if this is correct
+                                                            pub fn is_denormal(self) -> bool {
+                                                                self.0.is_subnormal()
+                                                            }
+
+                                                            pub fn bitwise_not(self) -> Self {
+                                                                let old_value = {
+                                                                    /*
+                                                                     * ! (ignoring for now)
+                                                                     * 7.1.6 ToInt32(argument)
+                                                                        let number = {
+                                                                            /*
+                                                                             * ? (ignoring for now)
+                                                                             * 7.1.4 ToNumber(argument)
+                                                                                let obj = match argument {
+                                                                                    Number(x) => return Ok(x),
+                                                                                    Symbol(_) | BigInt(_) => return Err(TypeErr),
+                                                                                    Undefined => return Ok(Number::from_f64(f64::NAN)),
+                                                                                    Null | Bool(_x @ false) => return Ok(Number::from_f64(0.0)),
+                                                                                    Bool(_x @ true) => return Ok(Number::from_f64(1.0)),
+                                                                                    String(s) => return s.to_number(),
+                                                                                    Object(o) => {
+                                                                                        let prim_value = {
+                                                                                            /*
+                                                                                             * ? (ignoring for now)
+                                                                                             * 7.1.1 ToPrimitive(input: JType, Option<preferredType>) -> JType
+                                                                                                pub enum ToPrimPref {
+                                                                                                    String,
+                                                                                                    Number,
+                                                                                                }
+                                                                                                
+                                                                                                pub fn to_primitive(input: JType, Option<ToPrimPref>) -> JType {
+                                                                                                    let exotic_to_prim = {
+                                                                                                        /*
+                                                                                                         * ? (ignoring for now)
+                                                                                                         * 7.3.10 GetMethod(P, V)
+                                                                                                            let func = {
+                                                                                                                /*
+                                                                                                                 * ? (ignoring for now)
+                                                                                                                 * 7.3.3 GetV(V, P)
+                                                                                                                    let o = {
+                                                                                                                        /*
+                                                                                                                         * ? (ignoring for now)
+                                                                                                                         * 7.1.18 ToObject(argument: JType) -> Result<Object, Object>
+                                                                                                                            match argument {
+                                                                                                                                Undefined | Null => Err(TypeErr),
+                                                                                                                                Bool(b) => Object::new(Boolean).set("BooleanData", b),
+                                                                                                                                Number(n) => Object::new(Number).set("NumberData", n),
+                                                                                                                                IString(s) => Object::new(String).set("StringData", s),
+                                                                                                                                Symbol(s) => Object::new(Symbol).set("SymbolData", s),
+                                                                                                                                BigInt(b) => Object::new(BigInt).set("BigIntData", b),
+                                                                                                                                Object(o) => Ok(o),
+                                                                                                                                _ => {
+                                                                                                                                    eprintln!("to_object: warning: called ToObject on Infra type");
+                                                                                                                                    Err(TypeErr)
+                                                                                                                                },
+                                                                                                                            }
+                                                                                                                         */
+                                                                                                                    }
+                                                                                                                 */
+                                                                                                            }
+                                                                                                         */
+                                                                                                    }
+                                                                                                }
+                                                                                             */
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                             */
+                                                                        }
+                                                                     */
+                                                                }
+                                                            }
+                                                        }
+
+                                                        impl Neg for Number {
+                                                            type Output = Self;
+
+                                                            fn neg(self) -> Self::Output {
+                                                                Number::from_f64(self.0.neg())
+                                                            }
+                                                        }
+                                                     */
+                                                }
+                                             */
+                                        },
+                                        Symbol(_) -> false,
+                                    }
+                                }
+                            }
+                            
+                            // Vec<Bool> is probably wrong but we'll get there when we get there
+                            enum Property {
+                                Data((IType, Vec<Bool>)),
+                                Accessor((Object, Option<Object>, Vec<Bool>)),
+                            }
+                     */
+                }
