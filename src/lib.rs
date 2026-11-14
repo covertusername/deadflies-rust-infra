@@ -12,7 +12,7 @@ pub mod primitives {
         /*js_base::{self, JSpecType, JType, Number, parse_text},*/ structs::{List, ListCore, Map, Queue, Set, Stack, Struct}, util::{ichars_from_str, is_valid_utf16, u16_slice_as_ichars}
     };
     use std::{
-        char::decode_utf16, fmt, ops::RangeBounds, slice, string::String, time::{Duration, Instant}
+        char::decode_utf16, fmt, ops::RangeBounds, slice, str::FromStr, string::String, time::{Duration, Instant}
     };
     use widestring::{U16String, Utf16String};
 
@@ -45,6 +45,20 @@ pub mod primitives {
         elems: Vec<u8>,
     }
 
+    impl FromStr for Byteseq {
+        type Err = !;
+    
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let mut ret = Self::new();
+            let bytes = s.bytes();
+
+            for b in bytes {
+                ret.elems.push(b);
+            }
+            Ok(ret)
+        }
+    }
+
     impl Byteseq {
         #[must_use]
         pub fn new() -> Self {
@@ -69,23 +83,6 @@ pub mod primitives {
         #[must_use]
         pub fn is_empty(&self) -> bool {
             self.len() == 0
-        }
-
-        /*
-         * the FromStr version of this returns a Result<>. this version can't
-         * fail, so silencing clippy for this
-         * may revisit this with Infallible
-         */
-        #[allow(clippy::should_implement_trait)]
-        #[must_use]
-        pub fn from_str(s: &str) -> Self {
-            let mut ret = Self::new();
-            let bytes = s.bytes();
-
-            for b in bytes {
-                ret.elems.push(b);
-            }
-            ret
         }
 
         #[must_use]

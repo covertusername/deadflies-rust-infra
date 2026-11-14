@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use deadflies_rust_infra::{primitives::{Byte, Byteseq, IChar, IString}};
 //use infra::old_js_base;
 //use infra::old_js_base::parse_text;
@@ -10,7 +11,7 @@ fn main() {
     println!("Byte construction test: {}", bval);
     assert!(bval.to_string() == "0xFF");
 
-    let bsval = Byteseq::from_str("Hello, world!");
+    let Ok(bsval) = Byteseq::from_str("Hello, world!");
 
     println!("\n***BYTESEQ TESTS***");
     assert!(
@@ -21,14 +22,14 @@ fn main() {
     println!("Byteseq from str, as str: {:#}", bsval);
     println!(
         "Byteseq from str, as str, with format fail: {:#}",
-        Byteseq::from_str("☝︎✌︎💧︎❄︎☜︎☼︎")
+        Byteseq::from_str("☝︎✌︎💧︎❄︎☜︎☼︎").unwrap()
     );
     println!("Byteseq from str, as bytes: '{}'", bsval);
 
     assert!(bsval.len() == 13);
     println!("Length of Byteseq: {}", bsval.len());
 
-    let mut bsval = Byteseq::from_str("HELLO, WORLD!");
+    let Ok(mut bsval) = Byteseq::from_str("HELLO, WORLD!");
 
     assert!(
         bsval.blower().to_string() == "0x68 0x65 0x6C 0x6C 0x6F 0x2C 0x20 \
@@ -60,16 +61,16 @@ fn main() {
         );
     }
 
-    let bsval = Byteseq::from_str("Hello, world!");
-    if bsval.starts_with(&Byteseq::from_str("Hello")) {
+    let Ok(bsval) = Byteseq::from_str("Hello, world!");
+    if bsval.starts_with(&Byteseq::from_str("Hello").unwrap()) {
         println!("`Hello, world!` starts with `Hello`")
     }
     else {
         println!("TEST FAILURE: `Hello, world!` does not start with `Hello`")
     }
 
-    let bsval = Byteseq::from_str("Goober");
-    if bsval.starts_with(&Byteseq::from_str("Foo")) {
+    let Ok(bsval) = Byteseq::from_str("Goober");
+    if bsval.starts_with(&Byteseq::from_str("Foo").unwrap()) {
         println!("TEST FAILURE: `Goober` should not start with `Foo`")
     }
     else {
@@ -112,7 +113,7 @@ fn main() {
         println!("Equivalent strings are not less than each other.")
     }
 
-    let bsval = Byteseq::from_str("Hello, world!");
+    let Ok(bsval) = Byteseq::from_str("Hello, world!");
     let binding = bsval.clone().isodecode();
     let utf16 = binding.unwrap();
     if bsval.len() != utf16.len() {
@@ -144,7 +145,7 @@ fn main() {
         }
     }
 
-    let bsval = Byteseq::from_str("☝︎✌︎💧︎❄︎☜︎☼︎");
+    let Ok(bsval) = Byteseq::from_str("☝︎✌︎💧︎❄︎☜︎☼︎");
     let binding = bsval.clone().isodecode();
     let utf16 = binding.unwrap();
     println!(
