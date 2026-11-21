@@ -831,7 +831,7 @@ where
      * originally wanted the second item in the tuple to be ArcRw<V>, but
      * this caused problems when V is a trait object. if you need to use a
      * trait object (or some non-cloneable type) as V then explicitly wrap it
-     * in a Box, ArcRw, or similar
+     * in a Box, Arc, or similar
      */
     items: Vec<(ArcRw<K>, V)>,
 }
@@ -884,6 +884,19 @@ where
     #[must_use]
     pub fn get_arc(&self, key: &ArcRw<K>) -> Option<V> {
         self.contains_key_arc(key).map(|i| self.items[i].1.clone())
+    }
+
+    #[must_use]
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V>
+    where
+        K: PartialEq,
+    {
+        self.contains_key(key).map(|i| &mut self.items[i].1)
+    }
+
+    #[must_use]
+    pub fn get_arc_mut(&mut self, key: &ArcRw<K>) -> Option<&mut V> {
+        self.contains_key_arc(key).map(|i| &mut self.items[i].1)
     }
 
     // the insane Infra definition
